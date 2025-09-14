@@ -1,79 +1,97 @@
 # 05_scale_vectors.py
 # Scale vector contours (from find-contours step) to the final drawing size.
-# Writes: <color>/contours_scaled.pkl
+# Inputs : <output>/<layer>/contours.pkl
+# Outputs: <output>/<layer>/contours_scaled.pkl
+from __future__ import annotations
 import os
 import pickle
+from typing import List, Tuple
+
 import cv2
 import numpy as np
-from typing import List, Tuple
 from config import load_config, Config
 
-def _get_target_scale(cfg: Config, w_src: int, h_src: int) -> Tuple[float, float]:
+
+def _target_size_px(cfg: Config) -> Tuple[int, int]:
     """
+    Determine target canvas size in pixels (W,H).
     Priority:
-      1) cfg.vector_scale (single float) -> isotropic
-      2) cfg.target_width_px / cfg.target_height_px -> fit keeping aspect
-      3) cfg.canvas_width_px / cfg.canvas_height_px -> fit keeping aspect
-      4) default 1.0
+      1) target_width_px / target_height_px (if present in config.json)
+      2) target_width_mm / target_height_mm with pixels_per_mm
+      3) fallback to resized.png size (keeps old behavior)
     """
-    # explicit scale
-    s = float(getattr(cfg, "vector_scale", 0.0) or 0.0)
-    if s > 0:
-        return s, s
+    tw_px = int(getattr(cfg, "target_width_px", 0) or 0)
+    th_px = int(getattr(cfg, "target_height_px", 0) or 0)
 
-    # explicit target box
-    tw = int(getattr(cfg, "target_width_px", 0) or 0)
-    th = int(getattr(cfg, "target_height_px", 0) or 0)
-    if tw > 0 or th > 0:
-        if tw <= 0:  # scale by height
-            s = th / float(h_src)
-            return s, s
-        if th <= 0:  # scale by width
-            s = tw / float(w_src)
-            return s, s
-        # both given -> fit
-        sx = tw / float(w_src)
-        sy = th / float(h_src)
+    if tw_px > 0 and th_px > 0:
+        return tw_px, th_px
+
+    tw_mm = float(getattr(cfg, "target_width_mm", 0) or 0)
+    th_mm = float(getattr(cfg, "target_height_mm", 0) or 0)
+    ppm   = int(getattr(cfg, "pixels_per_mm", 0) or 0)
+    if tw_mm > 0 and th_mm > 0 and ppm > 0:
+        return int(round(tw_mm * ppm)), int(round(th_mm * ppm))
+
+    # fallback: use resized.png shape
+    base = cv2.imread(os.path.join(cfg.output_dir, "resized.png"))
+    if base is None:
+        raise RuntimeError("Cannot infer target size: no target_* set and no resized.png found.")
+    h, w = base.shape[:2]
+    return w, h
+
+
+def _source_size_px(cfg: Config) -> Tuple[int, int]:
+    """Source reference size (W,H) — we use resized.png dimensions."""
+    base = cv2.imread(os.path.join(cfg.output_dir, "resized.png"))
+    if base is None:
+        raise RuntimeError("Missing resized.png (run step 1 first).")
+    h, w = base.shape[:2]
+    return w, h
+
+
+def _get_scale_factors(cfg: Config, w_src: int, h_src: int, w_tgt: int, h_tgt: int) -> Tuple[float, float]:
+    """
+    Compute scale factors (sx, sy).
+    If cfg.keep_aspect (default True), use isotropic scale = min(sx, sy).
+    Otherwise, allow anisotropic scaling.
+    """
+    keep_aspect = bool(getattr(cfg, "keep_aspect", True))
+    sx = w_tgt / max(1e-6, w_src)
+    sy = h_tgt / max(1e-6, h_src)
+    if keep_aspect:
         s = min(sx, sy)
         return s, s
+    return sx, sy
 
-    # canvas box
-    cw = int(getattr(cfg, "canvas_width_px", 0) or 0)
-    ch = int(getattr(cfg, "canvas_height_px", 0) or 0)
-    if cw > 0 and ch > 0:
-        sx = cw / float(w_src)
-        sy = ch / float(h_src)
-        s = min(sx, sy)
-        return s, s
 
-    return 1.0, 1.0
-
-def _scale_one(contours: List[np.ndarray], sx: float, sy: float) -> List[np.ndarray]:
-    out = []
-    for c in contours:
-        pts = c.reshape(-1, 2).astype(np.float32)
-        pts[:, 0] *= sx
-        pts[:, 1] *= sy
+def _scale_one(polys: List[np.ndarray], sx: float, sy: float) -> List[np.ndarray]:
+    out: List[np.ndarray] = []
+    if not polys:
+        return out
+    S = np.array([[sx, 0.0], [0.0, sy]], dtype=np.float32)
+    for p in polys:
+        pts = p.reshape(-1, 2).astype(np.float32)
+        pts = (pts @ S.T)
         out.append(pts.reshape(-1, 1, 2).astype(np.int32))
     return out
 
+
 def main():
     cfg: Config = load_config()
-    resized_path = os.path.join(cfg.output_dir, "resized.png")
-    img = cv2.imread(resized_path)
-    if img is None:
-        raise RuntimeError(f"Cannot read resized image: {resized_path}")
-    h_src, w_src = img.shape[:2]
+    os.makedirs(cfg.output_dir, exist_ok=True)
 
-    sx, sy = _get_target_scale(cfg, w_src, h_src)
-    print(f"[scale] source={w_src}x{h_src}, scale=({sx:.4f},{sy:.4f})")
+    w_src, h_src = _source_size_px(cfg)
+    w_tgt, h_tgt = _target_size_px(cfg)
+    sx, sy = _get_scale_factors(cfg, w_src, h_src, w_tgt, h_tgt)
+
+    print(f"[scale] source={w_src}x{h_src}, target={w_tgt}x{h_tgt}, scale=({sx:.4f},{sy:.4f})")
 
     for name in cfg.color_names:
         cdir = os.path.join(cfg.output_dir, name)
         os.makedirs(cdir, exist_ok=True)
         src = os.path.join(cdir, "contours.pkl")
         if not os.path.exists(src):
-            print(f"[scale] skip (missing): {src}")
+            print(f"[scale] {name}: missing {src}, skipping")
             continue
         with open(src, "rb") as f:
             contours: List[np.ndarray] = pickle.load(f)
@@ -82,9 +100,10 @@ def main():
         dst = os.path.join(cdir, "contours_scaled.pkl")
         with open(dst, "wb") as f:
             pickle.dump(scaled, f)
-        pts_before = sum(c.reshape(-1,2).shape[0] for c in contours)
-        pts_after  = sum(c.reshape(-1,2).shape[0] for c in scaled)
+        pts_before = sum(c.reshape(-1, 2).shape[0] for c in contours)
+        pts_after  = sum(c.reshape(-1, 2).shape[0] for c in scaled)
         print(f"[scale] {name}: contours={len(contours)}, vertices={pts_before} → {pts_after} → {dst}")
+
 
 if __name__ == "__main__":
     main()

@@ -10,8 +10,7 @@ from typing import List, Tuple
 
 # ----------------- config I/O -----------------
 def load_default_config():
-    # Lazy import to avoid importing project code at CLI parse time
-    from config import Config
+    from config import Config  # lazy import
     return Config()
 
 
@@ -26,12 +25,11 @@ def config_path(outdir: str) -> str:
 def write_config(cfg_obj, outdir: str, overrides: dict):
     """
     Persist config to outdir/config.json.
-    If a file already exists, we merge it with CLI overrides (CLI wins).
+    If a file already exists, merge it with CLI overrides (CLI wins).
     """
     dst = config_path(outdir)
     os.makedirs(outdir, exist_ok=True)
 
-    # Start from current on-disk config if present
     if os.path.exists(dst):
         try:
             with open(dst, "r", encoding="utf-8") as f:
@@ -41,7 +39,6 @@ def write_config(cfg_obj, outdir: str, overrides: dict):
     else:
         merged = asdict(cfg_obj)
 
-    # Apply CLI overrides (do not write None values)
     for k, v in overrides.items():
         if v is not None:
             merged[k] = v
@@ -70,21 +67,25 @@ def module_path(preferred: str, fallback: str | None = None) -> str:
         cand2 = os.path.join(here, fallback)
         if os.path.exists(cand2):
             return cand2
-    return cand1  # let subprocess fail clearly if truly missing
+    return cand1
 
 
 def build_steps() -> List[Tuple[str, str]]:
     return [
-        ("[1/10] Image resize…",            module_path("01_resize.py")),
-        ("[2/10] RGBK color extraction…",   module_path("02_color_extract.py")),
-        ("[3/10] Edge detection…",          module_path("03_edge_detect.py")),
-        ("[4/10] Find contours…",           module_path("04_find_contours.py")),
-        ("[5/10] Scale vectors…",           module_path("05_scale_vectors.py")),
-        ("[6/10] Sort contours…",           module_path("06_sort_contours.py")),
-        ("[7/10] Intra-layer dedup…",       module_path("07_dedup_layer_basic.py")),
-        ("[8/10] Cross-layer dedup…",       module_path("08_dedup_cross_basic.py")),
-        ("[9/10] Simplify contours…",       module_path("09_simplify.py")),
-        ("[10/10] Preview…",                module_path("10_preview.py")),
+        ("[1/14] Image resize…",                 module_path("01_resize.py")),
+        ("[2/14] RGBK color extraction…",        module_path("02_color_extract.py")),
+        ("[3/14] Edge detection…",               module_path("03_edge_detect.py")),
+        ("[4/14] Find contours…",                module_path("04_find_contours.py")),
+        ("[5/14] Scale vectors…",                module_path("05_scale_vectors.py")),
+        ("[6/14] Scaled vector preview…",        module_path("05_1_scaled_preview.py")),
+        ("[7/14] Sort contours…",                module_path("06_sort_contours.py")),
+        ("[8/14] Intra-layer dedup…",            module_path("07_dedup_layer_basic.py")),
+        ("[9/14] Preview after intra-dedup…",    module_path("07_1_preview.py")),
+        ("[10/14] Cross-layer dedup…",           module_path("08_dedup_cross_basic.py")),
+        ("[11/14] Preview after cross-dedup…",   module_path("08_01_preview.py")),
+        ("[12/14] Simplify contours…",           module_path("09_simplify.py")),
+        ("[13/14] Preview after simplify…",      module_path("09_01_preview.py")),
+        ("[14/14] Final preview…",               module_path("10_preview.py")),
     ]
 
 
@@ -98,7 +99,7 @@ def run_step(title: str, module: str, env: dict) -> None:
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
-            bufsize=1,  # line-buffered
+            bufsize=1,
         )
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -115,11 +116,13 @@ def run_step(title: str, module: str, env: dict) -> None:
         sys.exit(1)
 
 
-# ----------------- prereq checks (lightweight) -----------------
+# ----------------- prereq checks -----------------
 def missing_for_step(step_idx: int, outdir: str, color_names: List[str]) -> List[str]:
-    """Return a list of expected files that are missing for a given start step."""
+    """
+    Return a list of expected files that are missing for a given start step.
+    step_idx is 1-based.
+    """
     need: List[str] = []
-    # step_idx is 1-based
     if step_idx >= 2:
         need.append(os.path.join(outdir, "resized.png"))
     if step_idx >= 3:
@@ -129,21 +132,9 @@ def missing_for_step(step_idx: int, outdir: str, color_names: List[str]) -> List
     if step_idx >= 5:
         need += [os.path.join(outdir, c, "contours.pkl") for c in color_names]
     if step_idx >= 6:
-        # sorter typically consumes contours_scaled.pkl but can fall back;
-        # we don't hard-fail here
-        pass
-    if step_idx >= 7:
-        # dedup-layer will produce these; not a prereq
-        pass
-    if step_idx >= 8:
-        # cross-dedup may consume dedup_layer; keep soft
-        pass
-    if step_idx >= 9:
-        # simplify consumes dedup_cross or dedup_layer
-        pass
-    if step_idx >= 10:
-        # preview can run off any stage; no strict prereq here
-        pass
+        # scaled preview requires scaled contours from step 5
+        need += [os.path.join(outdir, c, "contours_scaled.pkl") for c in color_names]
+    # later steps read their step-specific artifacts, not enforced here
     return [p for p in need if not os.path.exists(p)]
 
 
@@ -152,8 +143,8 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Raster → Vector pipeline")
     ap.add_argument("input_image", help="Input raster image (e.g., portrait0.jpg)")
     ap.add_argument("--output", required=True, dest="output_dir", help="Output directory")
-    ap.add_argument("--start-step", type=int, default=1, help="1..10 (default: 1)")
-    ap.add_argument("--end-step", type=int, default=10, help="1..10 (default: 10)")
+    ap.add_argument("--start-step", type=int, default=1, help="1..11 (default: 1)")
+    ap.add_argument("--end-step", type=int, default=11, help="1..11 (default: 11)")
 
     # Optional overrides to inject into config.json
     ap.add_argument("--pixels-per-mm", type=int, dest="pixels_per_mm")
@@ -172,12 +163,7 @@ def main():
     args = parse_args()
     ensure_output_dir(args.output_dir)
 
-    # Base defaults
     cfg_defaults = load_default_config()
-
-    # Merge strategy:
-    #  - if output_dir/config.json exists → load & apply CLI overrides
-    #  - else → start from defaults & apply CLI overrides
     overrides = {
         "input_image": args.input_image,
         "output_dir": args.output_dir,
@@ -194,7 +180,7 @@ def main():
     cfg_file = write_config(cfg_defaults, args.output_dir, overrides)
     print("Config saved to", cfg_file)
 
-    # Read color_names for preflight checks / logs
+    # Read color_names for preflight checks
     try:
         with open(cfg_file, "r", encoding="utf-8") as f:
             cfg_dict = json.load(f)
@@ -202,12 +188,10 @@ def main():
     except Exception:
         cfg_colors = ["layer_dark", "layer_mid", "layer_skin", "layer_light"]
 
-    # Child process environment: propagate CONFIG_PATH so every module reads the right config
     env = os.environ.copy()
     env["CONFIG_PATH"] = cfg_file
-    env["PYTHONUNBUFFERED"] = "1"  # stream child stdout in real time
+    env["PYTHONUNBUFFERED"] = "1"
 
-    # Header
     print("=" * 50)
     print("RASTER → VECTOR PIPELINE")
     print("=" * 50)
@@ -217,21 +201,18 @@ def main():
     steps = build_steps()
     total_steps = len(steps)
 
-    # Clamp / validate range
     s0 = max(1, min(args.start_step, total_steps))
     s1 = max(1, min(args.end_step,   total_steps))
     if s0 > s1:
         s0, s1 = s1, s0
 
-    # Preflight for chosen start step
     missing = missing_for_step(s0, args.output_dir, cfg_colors)
     if missing:
         print("\n[Preflight] Warning: missing inputs for the chosen start step:")
         for p in missing:
             print(" -", p)
-        print("The step may fail; consider starting earlier or generating the missing artifacts.\n")
+        print("The step may fail; consider starting earlier or producing the missing artifacts.\n")
 
-    # Run selected steps
     for i in range(s0 - 1, s1):
         title, module = steps[i]
         run_step(title, module, env)
