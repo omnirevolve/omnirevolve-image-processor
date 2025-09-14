@@ -38,8 +38,27 @@ class Config:
     edge_morph_close_iters: int = 1
     smoothing_iterations: int = 2
 
+    # Iterations for in-layer conflict resolution
+    dedup_max_passes: int = 10
+
+    pen_width_px: int = 60                  # 1.5 mm @ 40 px/mm
+    pen_radius_px: int = 30                 # convenience = pen_width_px // 2
+
+    # taps (point strokes)
+    tap_max_area: float = 1200.0            # px^2 → convert tiny contours to taps
+    tap_max_perimeter: float = 160.0        # px   → or short perimeters to taps
+    tap_max_dim: int = 25                   # px   → or small bbox turns into a tap
+    tap_merge_radius_px: int = 30           # px   → collapse nearby taps until stable
+
+    # thinning
+    thinning_min_segment_len: int = 5       # points; discard ultra short fragments
+    thinning_dt_margin: float = 0.0         # extra safety distance over pen_radius    
+
     pen_width_px: int = 60           # pen width in pixels (no double passes within this)
     dedup_sample_step: int = 8       # subsampling step for distance check
+    
+    dedup_overlap_threshold: float = 0.60  # drop if ≥60% of stroke overlaps kept strokes
+    dedup_draw_antialiased: bool = False   # AA off → crisp binary overlap
 
     stop_after_edges: bool = False
 
