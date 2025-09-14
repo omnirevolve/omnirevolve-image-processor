@@ -1,0 +1,32 @@
+{
+  "input_image": "portrait0.jpg",
+  "output_dir": "output_jpg",
+  "max_dimension": 2000,
+
+  "colors": [
+    [230, 208, 188],
+    [164, 142, 145],
+    [87, 93, 99],
+    [28, 42, 60]
+  ],
+  "color_names": ["layer_light", "layer_skin", "layer_mid", "layer_dark"],
+  "color_tolerance": 60,
+
+  "edge_low_threshold": 22,
+  "edge_high_threshold": 70,
+  "edge_kernel_size": 7,
+  "edge_morph_kernel": 3,
+  "edge_morph_open_iters": 1,
+  "edge_morph_close_iters": 1,
+
+  "min_contour_area": 100,
+  "epsilon_factor": 0.0012,
+  "smoothing_iterations": 2,
+  "dedup_distance_threshold": 6.0,
+
+  "target_width_mm": 210,
+  "target_height_mm": 297,
+  "pixels_per_mm": 40,
+  "n_cores": 12,
+  "stop_after_edges": false
+}
