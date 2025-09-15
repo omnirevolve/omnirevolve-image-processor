@@ -88,6 +88,8 @@ def build_steps() -> List[Tuple[str, str]]:
         ("[14/14] Final preview…",               module_path("10_preview.py")),
     ]
 
+ALL_STEPS = build_steps()
+MAX_STEP = len(ALL_STEPS)
 
 # ----------------- stdout streaming -----------------
 def run_step(title: str, module: str, env: dict) -> None:
@@ -143,8 +145,9 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Raster → Vector pipeline")
     ap.add_argument("input_image", help="Input raster image (e.g., portrait0.jpg)")
     ap.add_argument("--output", required=True, dest="output_dir", help="Output directory")
-    ap.add_argument("--start-step", type=int, default=1, help="1..11 (default: 1)")
-    ap.add_argument("--end-step", type=int, default=11, help="1..11 (default: 11)")
+    
+    ap.add_argument("--start-step", type=int, default=1, help=f"1..{MAX_STEP} (default: 1)")
+    ap.add_argument("--end-step", type=int, default=MAX_STEP, help=f"1..{MAX_STEP} (default: {MAX_STEP})")
 
     # Optional overrides to inject into config.json
     ap.add_argument("--pixels-per-mm", type=int, dest="pixels_per_mm")
@@ -198,11 +201,12 @@ def main():
     print("Input image:", args.input_image)
     print("Output dir: ", args.output_dir)
 
-    steps = build_steps()
+    steps = ALL_STEPS
     total_steps = len(steps)
 
-    s0 = max(1, min(args.start_step, total_steps))
-    s1 = max(1, min(args.end_step,   total_steps))
+    s0 = max(1, min(args.start_step, MAX_STEP))
+    s1 = max(1, min(args.end_step,   MAX_STEP))
+
     if s0 > s1:
         s0, s1 = s1, s0
 
