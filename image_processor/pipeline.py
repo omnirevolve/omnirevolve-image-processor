@@ -7,20 +7,16 @@ import subprocess
 from dataclasses import asdict
 from typing import List, Tuple
 
-
 # ----------------- config I/O -----------------
 def load_default_config():
     from config import Config  # lazy import
     return Config()
 
-
 def ensure_output_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
-
 def config_path(outdir: str) -> str:
     return os.path.join(outdir, "config.json")
-
 
 def write_config(cfg_obj, outdir: str, overrides: dict):
     """
@@ -48,14 +44,12 @@ def write_config(cfg_obj, outdir: str, overrides: dict):
 
     return dst
 
-
 def read_existing_config(outdir: str):
     p = config_path(outdir)
     if not os.path.exists(p):
         return None
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
-
 
 # ----------------- steps -----------------
 def module_path(preferred: str, fallback: str | None = None) -> str:
@@ -69,23 +63,22 @@ def module_path(preferred: str, fallback: str | None = None) -> str:
             return cand2
     return cand1
 
-
 def build_steps() -> List[Tuple[str, str]]:
     return [
-        ("[1/14] Image resize…",                 module_path("01_resize.py")),
-        ("[2/14] RGBK color extraction…",        module_path("02_color_extract.py")),
-        ("[3/14] Edge detection…",               module_path("03_edge_detect.py")),
-        ("[4/14] Find contours…",                module_path("04_find_contours.py")),
-        ("[5/14] Scale vectors…",                module_path("05_scale_vectors.py")),
-        ("[6/14] Scaled vector preview…",        module_path("05_1_scaled_preview.py")),
-        ("[7/14] Sort contours…",                module_path("06_sort_contours.py")),
-        ("[8/14] Intra-layer dedup…",            module_path("07_dedup_layer_basic.py")),
-        ("[9/14] Preview after intra-dedup…",    module_path("07_1_preview.py")),
-        ("[10/14] Cross-layer dedup…",           module_path("08_dedup_cross_basic.py")),
-        ("[11/14] Preview after cross-dedup…",   module_path("08_01_preview.py")),
-        ("[12/14] Simplify contours…",           module_path("09_simplify.py")),
-        ("[13/14] Preview after simplify…",      module_path("09_01_preview.py")),
-        ("[14/14] Final preview…",               module_path("10_preview.py")),
+        ("[1/14] Image resize…",                  module_path("01_resize.py")),
+        ("[2/14] RGBK color extraction…",         module_path("02_color_extract.py")),
+        ("[3/14] Edge detection…",                module_path("03_edge_detect.py")),
+        ("[4/14] Find contours…",                 module_path("04_find_contours.py")),
+        ("[5/14] Scale vectors…",                 module_path("05_scale_vectors.py")),
+        ("[6/14] Scaled vector preview…",         module_path("06_preview_scaled.py")),
+        ("[7/14] Sort contours…",                 module_path("07_sort_contours.py")),
+        ("[8/14] Intra-layer dedup…",             module_path("08_dedup_layer_basic.py")),
+        ("[9/14] Preview after intra-dedup…",     module_path("09_preview_intra.py")),
+        ("[10/14] Cross-layer dedup…",            module_path("10_dedup_cross_basic.py")),
+        ("[11/14] Final preview…",                module_path("11_preview_cross.py")),
+        ("[12/14] Optimize plot order…",          module_path("12_optimize_plot_order.py")),
+        ("[13/14] Build stream…",                 module_path("13_build_stream.py")),
+        ("[14/14] Preview stream…",               module_path("14_preview_stream.py")),
     ]
 
 ALL_STEPS = build_steps()
@@ -117,12 +110,11 @@ def run_step(title: str, module: str, env: dict) -> None:
         print(f"\nError in {module} (exit={proc.returncode})")
         sys.exit(1)
 
-
 # ----------------- prereq checks -----------------
 def missing_for_step(step_idx: int, outdir: str, color_names: List[str]) -> List[str]:
     """
     Return a list of expected files that are missing for a given start step.
-    step_idx is 1-based.
+    step_idx is 1-based (the step you intend to start from).
     """
     need: List[str] = []
     if step_idx >= 2:
@@ -134,21 +126,31 @@ def missing_for_step(step_idx: int, outdir: str, color_names: List[str]) -> List
     if step_idx >= 5:
         need += [os.path.join(outdir, c, "contours.pkl") for c in color_names]
     if step_idx >= 6:
-        # scaled preview requires scaled contours from step 5
         need += [os.path.join(outdir, c, "contours_scaled.pkl") for c in color_names]
-    # later steps read their step-specific artifacts, not enforced here
+    if step_idx >= 8:
+        need += [os.path.join(outdir, c, "contours_scaled.pkl") for c in color_names]
+    if step_idx >= 9:
+        need += [os.path.join(outdir, c, "lines_intra.pkl") for c in color_names]
+    if step_idx >= 10:
+        need += [os.path.join(outdir, c, "lines_intra.pkl") for c in color_names]
+    if step_idx >= 11:
+        need += [os.path.join(outdir, c, "lines_cross.pkl") for c in color_names]
+    if step_idx >= 12:
+        need += [os.path.join(outdir, c, "lines_cross.pkl") for c in color_names]
+        need += [os.path.join(outdir, c, "taps_cross.pkl") for c in color_names]
+    if step_idx >= 13:
+        need.append(os.path.join(outdir, "vector_manifest.json"))
+    if step_idx >= 14:
+        need.append(os.path.join(outdir, "plot_stream.bin"))
     return [p for p in need if not os.path.exists(p)]
-
 
 # ----------------- CLI -----------------
 def parse_args():
     ap = argparse.ArgumentParser(description="Raster → Vector pipeline")
     ap.add_argument("input_image", help="Input raster image (e.g., portrait0.jpg)")
     ap.add_argument("--output", required=True, dest="output_dir", help="Output directory")
-    
     ap.add_argument("--start-step", type=int, default=1, help=f"1..{MAX_STEP} (default: 1)")
     ap.add_argument("--end-step", type=int, default=MAX_STEP, help=f"1..{MAX_STEP} (default: {MAX_STEP})")
-
     # Optional overrides to inject into config.json
     ap.add_argument("--pixels-per-mm", type=int, dest="pixels_per_mm")
     ap.add_argument("--target-width-mm", type=int, dest="target_width_mm")
@@ -159,7 +161,6 @@ def parse_args():
         help="Override colors as JSON, e.g. [[0,0,0],[255,0,0],[0,255,0],[0,0,255]] (BGR)",
     )
     return ap.parse_args()
-
 
 # ----------------- main -----------------
 def main():
@@ -206,7 +207,6 @@ def main():
 
     s0 = max(1, min(args.start_step, MAX_STEP))
     s1 = max(1, min(args.end_step,   MAX_STEP))
-
     if s0 > s1:
         s0, s1 = s1, s0
 
@@ -222,7 +222,6 @@ def main():
         run_step(title, module, env)
 
     print("\nDone.")
-
 
 if __name__ == "__main__":
     main()
