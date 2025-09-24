@@ -3,26 +3,12 @@
 """
 Plotter Preview — step/service stream visualizer.
 
-Stream format (bytes):
-- Step byte (MSB=1):
-    bit7=1
-    bit6=1 → two steps in one byte: 11 FFF SSS   (FFF=first step 0..7, SSS=second step 0..7)
-    bit6=0 → single step:           10 SSS 000   (SSS=step 0..7)
-- Service byte (MSB=0):
-    0x01 = Pen Up
-    0x02 = Pen Down
-    0x03 = Tap (draw filled dot; pen returns Up)
-    0x08..0x0F = Select Color (index 0..7; preview clamps to palette length)
-    0x40..0x7F = Set Speed divider (0..63)  [affects stats; preview playback ignores timing]
-    0x3F = EOF (end of stream)
-All other values are treated as unknown service bytes and ignored with a warning.
-
-UI:
-- SPACE play/pause, R reset
-- → step +100 commands, ← step -100 commands
-- +/- zoom; mouse wheel zoom
-- Slider to seek
-- Buttons: Play, Pause, Reset, Step, 0.5x/2x playback multipliers
+Notes:
+- All drawing is accumulated on render_surface and then blitted to the window.
+- Inside render_surface, a rectangular "workspace" (exact canvas size in steps)
+  is defined; the actual drawing is clipped to this region. Margins around the
+  workspace remain for frame/background.
+- Counts off-canvas draws (off_canvas_draws).
 """
 
 from __future__ import annotations
@@ -35,7 +21,7 @@ from PIL import Image
 
 # ---------------------------- Color Helpers ----------------------------
 
-def parse_color(spec: str) -> Tuple[int,int,int]:
+def parse_color(spec: str) -> Tuple[int, int, int]:
     s = spec.strip().lower()
     named = {
         'r': (255, 0, 0), 'red': (255, 0, 0),
@@ -70,14 +56,15 @@ class Config:
     tick_frequency: int = 10000   # base “tick” for playback; UI multiplies this
     colors: tuple = ((255, 0, 0), (0, 255, 0), (0, 0, 255), (0, 0, 0))  # palette indices 0..3
     background_white: bool = True
+    clip_to_canvas: bool = True   # strictly clip drawing to the canvas
 
-# diameter in screen pixels for tap visualization per color index (0..3)
+# Tap visualization diameter on screen (pixels) per palette index
 PEN_DIAM_PX = (10, 10, 10, 10)
 
 @dataclass
 class PlotterState:
-    x: int = 0       # step space X
-    y: int = 0       # step space Y
+    x: int = 0       # step-space X
+    y: int = 0       # step-space Y
     pen_down: bool = False
     color_idx: int = 0    # palette index
 
@@ -90,6 +77,7 @@ class Statistics:
     double_steps: int = 0
     steps_total: int = 0
     pen_down_segments: int = 0
+    taps: int = 0
     color_changes: int = 0
     speed_changes: int = 0
     eof_seen: bool = False
@@ -225,7 +213,7 @@ class PlotterPreview:
 
     # ------------- geometry & transforms -------------
     def _rebuild_render_surface(self):
-        # Available drawing area inside window (exclude controls)
+        # Available drawing area inside window (excludes controls)
         avail_w = self.win_w - 40
         avail_h = self.win_h - self.controls_h - 40
         self.render_w = max(400, min(self.cfg.render_width_px, avail_w))
@@ -239,11 +227,13 @@ class PlotterPreview:
         sx = self.render_w / max(1, self.cfg.canvas_steps_w)
         sy = self.render_h / max(1, self.cfg.canvas_steps_h)
         self.step_scale = min(sx, sy)
-        # Center the drawing area with small margins
+
+        # Workspace (canvas) in pixels inside render_surface
         used_w = int(self.cfg.canvas_steps_w * self.step_scale)
         used_h = int(self.cfg.canvas_steps_h * self.step_scale)
         self.offset_x = (self.render_w - used_w) // 2
         self.offset_y = (self.render_h - used_h) // 2
+        self.ws_rect = pygame.Rect(self.offset_x, self.offset_y, used_w, used_h)
 
     def _rebuild_ui(self):
         base_y = self.win_h - self.controls_h + 10
@@ -271,28 +261,46 @@ class PlotterPreview:
 
     # ------------- transforms -------------
     def _steps_to_px(self, x: int, y: int) -> Tuple[int, int]:
-        # Apply uniform scale and center offsets
+        # Coordinates inside render_surface
         px = int(self.offset_x + x * self.step_scale)
         py = int(self.offset_y + (self.cfg.canvas_steps_h - 1 - y) * self.step_scale) if self.cfg.invert_y \
              else int(self.offset_y + y * self.step_scale)
         return px, py
 
     # ------------- drawing helpers -------------
+    def _with_clip(self, draw_func):
+        """Execute draw_func with canvas clipping (if enabled)."""
+        if self.cfg.clip_to_canvas:
+            prev = self.render_surface.get_clip()
+            self.render_surface.set_clip(self.ws_rect)
+            try:
+                draw_func()
+            finally:
+                self.render_surface.set_clip(prev)
+        else:
+            draw_func()
+
     def _draw_line_steps(self, x1: int, y1: int, x2: int, y2: int):
-        x1p, y1p = self._steps_to_px(x1, y1)
-        x2p, y2p = self._steps_to_px(x2, y2)
-        # Clip count (optional; we skip strict check, lines outside will be clipped by pygame)
-        pygame.draw.line(self.render_surface, self.cur_color, (x1p, y1p), (x2p, y2p), 1)
+        def _do():
+            x1p, y1p = self._steps_to_px(x1, y1)
+            x2p, y2p = self._steps_to_px(x2, y2)
+            pygame.draw.line(self.render_surface, self.cur_color, (x1p, y1p), (x2p, y2p), 1)
+        self._with_clip(_do)
 
     def _draw_tap_steps(self, x: int, y: int, diam_px: int):
-        px, py = self._steps_to_px(x, y)
-        r = max(1, diam_px // 2)
-        pygame.draw.circle(self.render_surface, self.cur_color, (px, py), r, 0)
+        def _do():
+            px, py = self._steps_to_px(x, y)
+            r = max(1, diam_px // 2)
+            pygame.draw.circle(self.render_surface, self.cur_color, (px, py), r, 0)
+        self._with_clip(_do)
 
     # ------------- simulation -------------
     def _color_for_index(self, idx: int):
-        # clamp to palette length
+        # Clamp to palette length
         return self.palette[min(idx, len(self.palette) - 1)]
+
+    def _inside_canvas(self, x: int, y: int) -> bool:
+        return (0 <= x < self.cfg.canvas_steps_w) and (0 <= y < self.cfg.canvas_steps_h)
 
     def _process_one(self):
         if self.current_command >= len(self.decoder.commands):
@@ -304,11 +312,11 @@ class PlotterPreview:
             if v == 0x01:       # pen up
                 self.state.pen_down = False
             elif v == 0x02:     # pen down
-                # Count start of a new stroke
                 if not self.state.pen_down:
                     self.stats.pen_down_segments += 1
                 self.state.pen_down = True
             elif v == 0x03:     # tap
+                self.stats.taps += 1
                 if self.cfg.render_taps:
                     diam = PEN_DIAM_PX[min(self.state.color_idx, len(PEN_DIAM_PX)-1)]
                     self._draw_tap_steps(self.state.x, self.state.y, diam)
@@ -318,19 +326,20 @@ class PlotterPreview:
             self.state.color_idx = int(v)
             self.cur_color = self._color_for_index(self.state.color_idx)
             self.stats.color_changes += 1
-            # No implicit pen state change here (pen up/down handled explicitly)
 
         elif t == 'speed':
-            # Playback ignores divider for timing; we only count it
+            # Playback ignores divider for timing; count only
             pass
 
         elif t == 'step':
             dx, dy = STEP_DIRS.get(int(v), (0, 0))
             x0, y0 = self.state.x, self.state.y
-            self.state.x += dx
-            self.state.y += dy
-            if self.state.pen_down and (x0 != self.state.x or y0 != self.state.y):
-                self._draw_line_steps(x0, y0, self.state.x, self.state.y)
+            nx, ny = x0 + dx, y0 + dy
+            if not self._inside_canvas(nx, ny):
+                self.stats.off_canvas_draws += 1
+            self.state.x, self.state.y = nx, ny
+            if self.state.pen_down and (x0 != nx or y0 != ny):
+                self._draw_line_steps(x0, y0, nx, ny)
 
         self.current_command += 1
         self.stats.final_x, self.stats.final_y = self.state.x, self.state.y
@@ -373,23 +382,26 @@ class PlotterPreview:
             self.slider_handle.x = self.slider_rect.x + filled - 5
             pygame.draw.rect(self.screen, (50, 50, 150), self.slider_handle)
 
+    def _fmt(self, x: int) -> str:
+        return f"{int(x):,}".replace(",", " ")
+
     def _draw_info(self):
         base_y = self.win_h - self.controls_h + 95
+        e = self.stats
         info = [
-            f"Cmd: {self.current_command}/{len(self.decoder.commands)}",
-            f"Pos: ({self.state.x}, {self.state.y})  Pen: {'DOWN' if self.state.pen_down else 'UP'}",
+            f"Cmd: {self._fmt(self.current_command)}/{self._fmt(len(self.decoder.commands))}",
+            f"Pos: ({e.final_x}, {e.final_y})  Pen: {'DOWN' if self.state.pen_down else 'UP'}",
             f"Playback: {self.speed_mult:.1f}x  Tick: {self.tick_hz} Hz",
-            f"Bytes: {self.stats.total_bytes}  StepBytes: {self.stats.step_bytes}  ServiceBytes: {self.stats.service_bytes}",
-            f"Steps: {self.stats.steps_total}  Singles: {self.stats.single_steps}  Doubles: {self.stats.double_steps}",
-            f"Color changes: {self.stats.color_changes}  Speed changes: {self.stats.speed_changes}",
-            f"Final: ({self.stats.final_x}, {self.stats.final_y})",
+            f"Bytes: {self._fmt(e.total_bytes)}  Steps: {self._fmt(e.steps_total)}  Singles: {self._fmt(e.single_steps)}  Doubles: {self._fmt(e.double_steps)}",
+            f"Services: {self._fmt(e.service_bytes)}  Colors: {self._fmt(e.color_changes)}  Speeds: {self._fmt(e.speed_changes)}  Taps: {self._fmt(e.taps)}",
+            f"PenDown segments: {self._fmt(e.pen_down_segments)}  Off-canvas draws: {self._fmt(e.off_canvas_draws)}  Tail after EOF: {self._fmt(e.tail_after_eof)}",
         ]
         for i, s in enumerate(info):
             surf = self.small_font.render(s, True, (35, 35, 35))
-            self.screen.blit(surf, (10 + (i % 3) * 340, base_y + (i // 3) * 22))
+            self.screen.blit(surf, (10 + (i % 3) * 430, base_y + (i // 3) * 22))
 
         # Palette legend
-        lx = self.win_w - 220
+        lx = self.win_w - 240
         ly = base_y - 10
         self.screen.blit(self.small_font.render("Palette:", True, (40, 40, 40)), (lx, ly))
         for i, c in enumerate(self.palette):
@@ -429,7 +441,6 @@ class PlotterPreview:
 
                 elif e.type == pygame.MOUSEBUTTONDOWN and e.button in (4, 5):  # wheel
                     factor = 1.1 if e.button == 4 else (1/1.1)
-                    # zoom by rebuilding render surface size target
                     self.cfg.render_width_px = int(self.cfg.render_width_px * factor)
                     self.cfg.render_height_px = int(self.cfg.render_height_px * factor)
                     self._rebuild_render_surface()
@@ -452,7 +463,7 @@ class PlotterPreview:
                         self.cfg.render_height_px = int(self.cfg.render_height_px / 1.2)
                         self._rebuild_render_surface(); self._replay_to(self.current_command)
 
-            # playback
+            # Playback
             if self.playing and self.current_command < len(self.decoder.commands):
                 self._tick_accum += dt * self.tick_hz * self.speed_mult
                 steps = int(min(self._tick_accum, 5000))
@@ -462,17 +473,22 @@ class PlotterPreview:
                         self._process_one()
                     self._tick_accum -= steps
 
-            # draw frame
+            # Draw frame
             self.screen.fill((240, 240, 240))
             # Place render surface centered
             cx = (self.win_w - self.render_w) // 2
             cy = (self.win_h - self.controls_h - self.render_h) // 2
             self.screen.blit(self.render_surface, (cx, cy))
+            # Outer border — whole render surface
             pygame.draw.rect(self.screen, (100, 100, 100), (cx, cy, self.render_w, self.render_h), 2)
+            # Inner border — strict canvas boundaries
+            pygame.draw.rect(self.screen, (30, 30, 30),
+                             (cx + self.ws_rect.x, cy + self.ws_rect.y, self.ws_rect.w, self.ws_rect.h), 1)
 
-            # cursor
+            # Cursor
             cur_px, cur_py = self._steps_to_px(self.state.x, self.state.y)
-            pygame.draw.circle(self.screen, self.cur_color if self.state.pen_down else (0, 200, 0),
+            pygame.draw.circle(self.screen,
+                               self.cur_color if self.state.pen_down else (0, 200, 0),
                                (cx + cur_px, cy + cur_py), 5)
             pygame.draw.circle(self.screen, (0, 0, 0), (cx + cur_px, cy + cur_py), 5, 1)
 
@@ -489,12 +505,15 @@ class PlotterPreview:
 
     def _print_stats(self):
         e = self.stats
+        def F(x): return f"{int(x):,}".replace(",", " ")
         print("\n=== Statistics ===", file=sys.stderr)
-        print(f"Total bytes: {e.total_bytes}", file=sys.stderr)
-        print(f"Step bytes: {e.step_bytes}  Service bytes: {e.service_bytes}", file=sys.stderr)
-        print(f"Steps: {e.steps_total}  Singles: {e.single_steps}  Doubles: {e.double_steps}", file=sys.stderr)
-        print(f"Color changes: {e.color_changes}  Speed changes: {e.speed_changes}", file=sys.stderr)
-        print(f"EOF seen: {e.eof_seen}  Tail after EOF: {e.tail_after_eof}", file=sys.stderr)
+        print(f"Total bytes: {F(e.total_bytes)}", file=sys.stderr)
+        print(f"Step bytes: {F(e.step_bytes)}  Service bytes: {F(e.service_bytes)}", file=sys.stderr)
+        print(f"Steps: {F(e.steps_total)}  Singles: {F(e.single_steps)}  Doubles: {F(e.double_steps)}", file=sys.stderr)
+        print(f"PenDown segments: {F(e.pen_down_segments)}  Taps: {F(e.taps)}", file=sys.stderr)
+        print(f"Color changes: {F(e.color_changes)}  Speed changes: {F(e.speed_changes)}", file=sys.stderr)
+        print(f"Off-canvas draws: {F(e.off_canvas_draws)}", file=sys.stderr)
+        print(f"EOF seen: {e.eof_seen}  Tail after EOF: {F(e.tail_after_eof)}", file=sys.stderr)
         print(f"Final position: ({e.final_x}, {e.final_y})", file=sys.stderr)
 
     def save_image(self, path: str):
@@ -519,10 +538,11 @@ def main():
     # Canvas in steps (mechanical workspace)
     ap.add_argument('--canvas-w-steps', type=int, default=13210)
     ap.add_argument('--canvas-h-steps', type=int, default=13019)
-    ap.add_argument('--invert-y', type=int, choices=[0,1], default=1)
-    ap.add_argument('--background-white', type=int, choices=[0,1], default=1)
-    ap.add_argument('--render-taps', type=int, choices=[0,1], default=1)
+    ap.add_argument('--invert-y', type=int, choices=[0, 1], default=1)
+    ap.add_argument('--background-white', type=int, choices=[0, 1], default=1)
+    ap.add_argument('--render-taps', type=int, choices=[0, 1], default=1)
     ap.add_argument('--tick-freq', type=int, default=10000)
+    ap.add_argument('--no-clip', action='store_true', help='Do not clip drawing to canvas')
 
     # Palette (color indices)
     ap.add_argument('--c0', default='R'); ap.add_argument('--c1', default='G')
@@ -542,6 +562,7 @@ def main():
         render_taps=bool(args.render_taps),
         tick_frequency=args.tick_freq,
         colors=palette,
+        clip_to_canvas=not args.no_clip,
     )
 
     data = open(args.input, 'rb').read()

@@ -31,6 +31,17 @@ def _target_size_px(cfg: Config) -> Tuple[int, int]:
     return w, h
 
 
+def _margins_px(cfg: Config) -> Tuple[int, int, int, int]:
+    ppm = int(getattr(cfg, "pixels_per_mm", 40) or 40)
+    ml = int(round(float(getattr(cfg, "margin_left_mm", 10.0))   * ppm))
+    mr = int(round(float(getattr(cfg, "margin_right_mm", 10.0))  * ppm))
+    mt = int(round(float(getattr(cfg, "margin_top_mm", 10.0))    * ppm))
+    mb = int(round(float(getattr(cfg, "margin_bottom_mm", 10.0)) * ppm))
+    # clamp non-negative
+    ml = max(0, ml); mr = max(0, mr); mt = max(0, mt); mb = max(0, mb)
+    return ml, mr, mt, mb
+
+
 def _load_palette_by_name(outdir: str, color_names: List[str], fallback_colors: List[Tuple[int,int,int]]) -> Dict[str, Tuple[int,int,int]]:
     path = os.path.join(outdir, "palette_by_name.json")
     mapping: Dict[str, Tuple[int,int,int]] = {}
@@ -69,7 +80,7 @@ def _draw_layer(polys: List[np.ndarray], size: Tuple[int,int], color: Tuple[int,
         return img
     lt = cv2.LINE_AA if aa else cv2.LINE_8
     for p in polys:
-        if p is None: 
+        if p is None:
             continue
         arr = p.reshape(-1, 1, 2).astype(np.int32)
         if len(arr) >= 2:
@@ -86,7 +97,12 @@ def main():
     thickness = int(getattr(cfg, "scaled_preview_thickness_px", 1))
     aa = bool(getattr(cfg, "scaled_preview_antialiased", True))
 
-    size = _target_size_px(cfg)  # (W,H) exact target canvas
+    size = _target_size_px(cfg)  # (W,H) exact full canvas
+    ml, mr, mt, mb = _margins_px(cfg)
+    inner_w = max(1, size[0] - ml - mr)
+    inner_h = max(1, size[1] - mt - mb)
+    print(f"[scaled_preview] canvas(full)={size[0]}x{size[1]}, margins(l,r,t,b)=({ml},{mr},{mt},{mb}), inner={inner_w}x{inner_h}, offset=({ml},{mt})")
+
     palette = _load_palette_by_name(outdir, cfg.color_names, cfg.colors)
 
     composite = np.full((size[1], size[0], 3), 255, np.uint8)
@@ -102,7 +118,7 @@ def main():
         total_polys += len(polys)
         total_vertices += vcount
 
-        # per-layer preview
+        # per-layer preview (black)
         layer_img = _draw_layer(polys, size, (0,0,0), thickness, aa)
         out_layer = os.path.join(layer_dir, "scaled_preview.png")
         cv2.imwrite(out_layer, layer_img)

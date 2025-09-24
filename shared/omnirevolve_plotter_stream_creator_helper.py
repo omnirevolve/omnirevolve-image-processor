@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xyplotter_stream_creator_helper.py — universal helpers for building XY-plotter streams.
+omnirevolve_plotter_stream_creator_helper.py — universal helpers for building XY-plotter streams.
 
 Protocol:
 - Step byte (MSB=1):
@@ -12,23 +12,17 @@ Protocol:
   * Pen: 0x01=pen up, 0x02=pen down, 0x03=tap
   * Color select: 0x08..0x0F  (index 0..7)
   * EOF: 0x3F
-- Streams are padded to SPI_CHUNK_SIZE (1024 bytes).
 
-This module provides:
-- Config: kinematics & motion defaults (mm/step, dividers, ramp lengths, corner handling).
-- StreamWriter: protocol-aware writer (service bytes, packed step bytes, finalize).
-- bresenham_dir_codes: direction codes (0..7) between points.
-- Ramp helpers: S-curve / triangle distribution, fixed-length accel/decel windows.
-- Corner-aware polylines: slow-in/slow-out around sharp angles.
-- travel_ramped: pen-up travel with fixed 2 cm accel/decel windows by default.
+This version:
+- Explicit initial speed set at stream start (to avoid accidentally starting at 63).
+- Separate travel profile: travel_start_div + travel_window_steps.
+- Quantized ramps (coarse levels) to reduce speed flips (less motor "singing").
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Tuple, Dict, Optional, Any
 import math
-
-# --------------------------- Workspace & directions ---------------------------
 
 SPI_CHUNK_SIZE = 1024
 WORK_MAX_X = 13210
@@ -44,7 +38,7 @@ __all__ = [
     "make_speed_byte", "pack_steps",
     "build_counts_triangle", "build_counts_scurve",
     "bresenham_dir_codes",
-    "emit_steps_accel", "emit_steps_decel", "emit_steps_with_symmetric_ramp",
+    "emit_steps_accel", "emit_steps_decel",
     "emit_segment_with_corner_profile", "emit_polyline",
     "travel_ramped",
 ]
@@ -52,7 +46,6 @@ __all__ = [
 # ------------------------------- Encoding core -------------------------------
 
 def make_speed_byte(divider: int) -> int:
-    """Service byte for speed setting: MSB=0, 0x40 | (divider & 0x3F)."""
     if (int(divider) > 63):
         divider = 63
     if (int(divider) < 0):
@@ -60,12 +53,6 @@ def make_speed_byte(divider: int) -> int:
     return 0x40 | (int(divider) & 0x3F)
 
 def pack_steps(step_codes: Iterable[int]) -> bytearray:
-    """
-    Pack 0..7 step codes using:
-      - two-step bytes: 11 FFF SSS
-      - single-step bytes: 10 SSS 000
-    Preference: emit as many two-step bytes as possible; last odd one as single-step.
-    """
     out = bytearray()
     codes = [int(c) & 0x07 for c in step_codes]
     i = 0
@@ -80,43 +67,30 @@ def pack_steps(step_codes: Iterable[int]) -> bytearray:
             i += 1
     return out
 
-# ------------------------------- S-curve / triangle ramps -------------------------------
+# ------------------------------- Ramps & helpers -------------------------------
 
 def _distribute_even(total_steps: int, levels: int) -> List[int]:
-    if levels <= 0:
-        return []
+    if levels <= 0: return []
     base = total_steps // levels
-    rem = total_steps % levels
+    rem  = total_steps % levels
     return [base + (1 if i < rem else 0) for i in range(levels)]
 
 def build_counts_triangle(length: int, div_fast: int, div_slow: int) -> Dict[int, int]:
-    """
-    Linear ramp distribution over `length` steps across dividers from div_slow→div_fast (inclusive).
-    Returns: dict {divider -> steps_at_that_divider}.
-    """
-    if length <= 0:
-        return {}
-    if div_slow < div_fast:
-        raise ValueError("div_slow must be >= div_fast")
+    if length <= 0: return {}
+    if div_slow < div_fast: raise ValueError("div_slow must be >= div_fast")
     levels = div_slow - div_fast + 1
     per = _distribute_even(length, levels)
-    out: Dict[int, int] = {}
+    out: Dict[int,int] = {}
     for i, cnt in enumerate(per):
         div = div_slow - i
-        out[div] = out.get(div, 0) + cnt
+        if cnt > 0: out[div] = out.get(div, 0) + cnt
     return out
 
 def build_counts_scurve(length: int, div_fast: int, div_slow: int) -> Dict[int, int]:
-    """
-    Smoothstep (3t^2 - 2t^3) ramp distribution over `length` steps, div_slow→div_fast.
-    Returns: dict {divider -> steps_at_that_divider}.
-    """
-    if length <= 0:
-        return {}
-    if div_slow < div_fast:
-        raise ValueError("div_slow must be >= div_fast")
+    if length <= 0: return {}
+    if div_slow < div_fast: raise ValueError("div_slow must be >= div_fast")
     span = div_slow - div_fast
-    out: Dict[int, int] = {}
+    out: Dict[int,int] = {}
     for i in range(length):
         t = (i + 0.5) / length
         s = (3 * t * t) - (2 * t * t * t)
@@ -125,23 +99,42 @@ def build_counts_scurve(length: int, div_fast: int, div_slow: int) -> Dict[int, 
         out[div] = out.get(div, 0) + 1
     return out
 
+def _quantized_levels(div_slow: int, div_fast: int, step: int = 4) -> List[int]:
+    """Coarse levels from slow to fast inclusive, e.g. 28,24,20,16,12,10 for step=4."""
+    if div_slow < div_fast: div_slow, div_fast = div_fast, div_slow
+    levels = list(range(div_slow, div_fast - 1, -step))
+    if levels[-1] != div_fast:
+        levels.append(div_fast)
+    return levels
+
 # --------------------------------- Writer -----------------------------------
 
 @dataclass
 class Config:
     steps_per_mm: float = 40.0
     invert_y: bool = True
-    # base ramp profile (for drawing/pen-down)
-    div_start: int = 30        # start/stop divider (slow end)
-    div_fast: int  = 15        # drawing cruise divider
-    profile: str = "triangle"    # "scurve" or "triangle"
-    # pen-up travel cruise
-    travel_div_fast: int = 10  # travel (pen-up) cruise divider
-    # corner handling (also used as default accel/decel window length)
+
+    # Drawing profile (pen-down)
+    div_start: int = 28
+    div_fast: int  = 15
+    profile: str = "triangle"
+
+    # Corner handling
     corner_deg: float = 85.0
-    corner_div: int = 30       # target slow divider at sharp corners
-    corner_window_steps: int = 400  # default accel/decel window ≈ 1 cm @ 40 steps/mm
-    # optional soft tail (not used here by default)
+    corner_div: int = 28
+    corner_window_steps: int = 300
+
+    # Short edges (no corners)
+    short_len_steps: int = 120
+    short_div: int = 16
+
+    # Travel (pen-up) profile — separate
+    travel_div_fast: int = 10
+    travel_start_div: int = 28
+    travel_window_steps: int = 240
+    travel_quant_step: int = 4   # quantization of speed levels for travel ramps
+
+    # Optional soft tail (unused)
     soft_tail_steps: int = 0
     soft_tail_div: int = 20
 
@@ -149,12 +142,10 @@ class Config:
         return int(round(mm * self.steps_per_mm))
 
 class StreamWriter:
-    """
-    Protocol-aware byte stream builder.
-    """
-    def __init__(self, *_ignored: Any, **__ignored: Any):
+    def __init__(self, *_: Any, **__: Any):
         self.out = bytearray()
         self._cur_speed: Optional[int] = None
+        self._started = False
 
     # service bytes
     def set_speed(self, divider: int):
@@ -171,7 +162,7 @@ class StreamWriter:
         if not (0 <= color_index <= 7): raise ValueError("color index 0..7")
         self.out.append(0x08 | (color_index & 0x07))
 
-    # step bytes
+    # steps
     def add_steps(self, step_codes: Iterable[int]):
         self.out += pack_steps(step_codes)
 
@@ -190,7 +181,6 @@ def clamp_xy(x: int, y: int, wmax: int = WORK_MAX_X, hmax: int = WORK_MAX_Y) -> 
     return x, y
 
 def bresenham_dir_codes(x0: int, y0: int, x1: int, y1: int) -> List[int]:
-    """Generate direction codes (0..7) to move from (x0,y0) to (x1,y1)."""
     x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
     codes: List[int] = []
     dx, dy = abs(x1 - x0), abs(y1 - y0)
@@ -202,13 +192,9 @@ def bresenham_dir_codes(x0: int, y0: int, x1: int, y1: int) -> List[int]:
         e2 = err * 2
         moved_x = moved_y = 0
         if e2 > -dy:
-            err -= dy
-            x += sx
-            moved_x = 1
+            err -= dy; x += sx; moved_x = 1
         if e2 < dx:
-            err += dx
-            y += sy
-            moved_y = 1
+            err += dx; y += sy; moved_y = 1
         if moved_x and moved_y:
             if sx > 0 and sy > 0: codes.append(DIR_NE)
             elif sx > 0 and sy < 0: codes.append(DIR_SE)
@@ -220,7 +206,7 @@ def bresenham_dir_codes(x0: int, y0: int, x1: int, y1: int) -> List[int]:
             codes.append(DIR_POSY if sy > 0 else DIR_NEGY)
     return codes
 
-# ------------------------------- Ramp helpers -------------------------------
+# --------------------------- Ramp helpers ---------------------------
 
 def _build_counts(profile: str, length: int, div_fast: int, div_slow: int) -> Dict[int, int]:
     if profile == "scurve":
@@ -230,7 +216,9 @@ def _build_counts(profile: str, length: int, div_fast: int, div_slow: int) -> Di
     raise ValueError("profile must be 'triangle' or 'scurve'")
 
 def emit_steps_accel(w: StreamWriter, step_codes: List[int], profile: str, div_fast: int, start_div: int):
-    """Accelerate from start_div → div_fast across provided step_codes (forward order)."""
+    if not step_codes: return
+    if start_div <= div_fast:
+        w.set_speed(div_fast); w.add_steps(step_codes); return
     counts = _build_counts(profile, len(step_codes), div_fast, start_div)
     idx = 0
     for div in range(start_div, div_fast - 1, -1):
@@ -239,7 +227,9 @@ def emit_steps_accel(w: StreamWriter, step_codes: List[int], profile: str, div_f
         w.set_speed(div); w.add_steps(step_codes[idx:idx+cnt]); idx += cnt
 
 def emit_steps_decel(w: StreamWriter, step_codes: List[int], profile: str, div_fast: int, end_div: int):
-    """Decelerate from div_fast → end_div across provided step_codes (forward order)."""
+    if not step_codes: return
+    if end_div <= div_fast:
+        w.set_speed(div_fast); w.add_steps(step_codes); return
     counts = _build_counts(profile, len(step_codes), div_fast, end_div)
     idx = 0
     for div in range(div_fast, end_div + 1):
@@ -247,20 +237,9 @@ def emit_steps_decel(w: StreamWriter, step_codes: List[int], profile: str, div_f
         if cnt <= 0: continue
         w.set_speed(div); w.add_steps(step_codes[idx:idx+cnt]); idx += cnt
 
-def emit_steps_with_symmetric_ramp(w: StreamWriter, step_codes: List[int], profile: str, div_fast: int, div_start: int):
-    """(Legacy) symmetric accel/decel over the whole segment (no fixed ramp length)."""
-    N = len(step_codes)
-    if N == 0: return
-    half = N // 2
-    emit_steps_accel(w, step_codes[:half], profile, div_fast, div_start)
-    if N % 2 == 1:
-        w.set_speed(div_fast); w.add_steps(step_codes[half:half+1]); half += 1
-    emit_steps_decel(w, step_codes[half:], profile, div_fast, div_start)
-
 # --------------------------- Corner-aware polylines --------------------------
 
 def angle_degrees(ax: int, ay: int, bx: int, by: int, cx: int, cy: int) -> float:
-    """Return interior angle at B formed by A-B-C in degrees."""
     v1x, v1y = ax - bx, ay - by
     v2x, v2y = cx - bx, cy - by
     n1 = math.hypot(v1x, v1y); n2 = math.hypot(v2x, v2y)
@@ -279,64 +258,50 @@ def emit_segment_with_corner_profile(
     corner_window_steps: int,
     slow_in: bool,
     slow_out: bool,
+    short_len_steps: int = 120,
+    short_div: int = 16,
 ):
-    """
-    Emit one segment with fixed-length entry/exit windows.
-    - Entry: accel from (corner_div if slow_in else div_start) → div_fast over `corner_window_steps`.
-    - Cruise: div_fast mid part (if any).
-    - Exit : decel from div_fast → (corner_div if slow_out else div_start) over `corner_window_steps`.
-    If segment is shorter than entry+exit windows, a triangular profile is used.
-    """
     N = len(step_codes)
     if N == 0: return
-    start_div = corner_div if slow_in else div_start
-    end_div   = corner_div if slow_out else div_start
 
-    if N <= 2 * corner_window_steps:
-        half = max(1, N // 2)
-        emit_steps_accel(w, step_codes[:half], profile, div_fast, start_div)
-        if N % 2 == 1:
-            w.set_speed(div_fast); w.add_steps(step_codes[half:half+1]); half += 1
-        emit_steps_decel(w, step_codes[half:], profile, div_fast, end_div)
+    if not slow_in and not slow_out:
+        w.set_speed(short_div if N <= short_len_steps else div_fast)
+        w.add_steps(step_codes)
         return
 
-    entry_len = corner_window_steps
-    exit_len  = corner_window_steps
-    cruise_len = N - entry_len - exit_len
+    entry_len = min(corner_window_steps if slow_in else 0, N)
+    exit_len  = min(corner_window_steps if slow_out else 0, max(0, N - entry_len))
+    mid_len   = max(0, N - entry_len - exit_len)
 
-    entry_codes  = step_codes[:entry_len]
-    cruise_codes = step_codes[entry_len:entry_len+cruise_len]
-    exit_codes   = step_codes[-exit_len:]
+    if entry_len + exit_len >= N:
+        half = N // 2
+        if half > 0:
+            emit_steps_accel(w, step_codes[:half], profile, div_fast, corner_div if slow_in else div_start)
+        if N % 2 == 1:
+            w.set_speed(div_fast); w.add_steps(step_codes[half:half+1]); half += 1
+        rest = step_codes[half:]
+        if rest:
+            emit_steps_decel(w, rest, profile, div_fast, corner_div if slow_out else div_start)
+        return
 
-    emit_steps_accel(w, entry_codes, profile, div_fast, start_div)
-    if cruise_codes:
-        w.set_speed(div_fast); w.add_steps(cruise_codes)
-    emit_steps_decel(w, exit_codes, profile, div_fast, end_div)
+    if entry_len > 0:
+        emit_steps_accel(w, step_codes[:entry_len], profile, div_fast, corner_div)
+    if mid_len > 0:
+        w.set_speed(div_fast); w.add_steps(step_codes[entry_len:entry_len+mid_len])
+    if exit_len > 0:
+        emit_steps_decel(w, step_codes[-exit_len:], profile, div_fast, corner_div)
 
-def emit_polyline(
-    w: StreamWriter,
-    cfg: Config,
-    *args,
-    color_index: Optional[int] = None,
-):
-    """
-    Emit a polyline with corner-aware entry/exit using fixed-length accel/decel windows.
-    Signature: emit_polyline(w, cfg, pts, color_index=None)
-    """
+def emit_polyline(w: StreamWriter, cfg: Config, *args, color_index: Optional[int] = None):
     if len(args) == 1:
         pts = args[0]
     else:
         raise TypeError("emit_polyline(w, cfg, pts, ...) expected")
-
-    if not pts or len(pts) < 2:
-        return
-    if color_index is not None:
-        w.select_color(color_index)
+    if not pts or len(pts) < 2: return
+    if color_index is not None: w.select_color(color_index)
 
     for i in range(len(pts)-1):
         a = pts[i-1] if i-1 >= 0 else pts[i]
-        b = pts[i]
-        c = pts[i+1]
+        b = pts[i]; c = pts[i+1]
         ang_in = angle_degrees(a[0],a[1], b[0],b[1], c[0],c[1]) if i>0 else 180.0
         slow_in = (i>0 and ang_in < cfg.corner_deg)
         if (i+2) < len(pts):
@@ -348,19 +313,34 @@ def emit_polyline(
         emit_segment_with_corner_profile(
             w, codes, cfg.profile, cfg.div_fast, cfg.div_start,
             cfg.corner_div, cfg.corner_window_steps,
-            slow_in=slow_in, slow_out=slow_out
+            slow_in=slow_in, slow_out=slow_out,
+            short_len_steps=cfg.short_len_steps, short_div=cfg.short_div
         )
 
 # ----------------------------- Pen-up travel -----------------------------
 
+def _emit_quantized_accel(w: StreamWriter, codes: List[int], levels: List[int], profile: str):
+    """Split codes evenly across given speed levels (slow→fast)."""
+    if not codes or not levels: return
+    parts = _distribute_even(len(codes), len(levels))
+    idx = 0
+    for div, cnt in zip(levels, parts):
+        if cnt <= 0: continue
+        w.set_speed(div); w.add_steps(codes[idx:idx+cnt]); idx += cnt
+
+def _emit_quantized_decel(w: StreamWriter, codes: List[int], levels: List[int], profile: str):
+    """Split codes evenly across given speed levels (fast→slow)."""
+    if not codes or not levels: return
+    parts = _distribute_even(len(codes), len(levels))
+    idx = 0
+    for div, cnt in zip(levels, parts):
+        if cnt <= 0: continue
+        w.set_speed(div); w.add_steps(codes[idx:idx+cnt]); idx += cnt
+
 def travel_ramped(w: StreamWriter, *args):
     """
-    Pen-up travel with fixed-length accel/decel windows (default 2 cm each side).
+    Pen-up travel with short, quantized accel/decel ramps.
     Signature: travel_ramped(w, x0, y0, x1, y1, cfg)
-    - Accelerate from cfg.div_start → cfg.travel_div_fast over cfg.corner_window_steps.
-    - Cruise at cfg.travel_div_fast (if distance allows).
-    - Decelerate from cfg.travel_div_fast → cfg.div_start over cfg.corner_window_steps.
-    If the move is too short, a triangular profile is used automatically.
     """
     if len(args) != 5:
         raise TypeError("travel_ramped(w, x0, y0, x1, y1, cfg) expected")
@@ -368,19 +348,17 @@ def travel_ramped(w: StreamWriter, *args):
 
     codes = bresenham_dir_codes(x0, y0, x1, y1)
     N = len(codes)
-    if N == 0:
-        return
+    if N == 0: return
 
-    # Use the same fixed window length as for corners; equals ≈2 cm by default.
-    win = int(cfg.corner_window_steps)
-    div_fast = int(cfg.travel_div_fast)
-    div_start = int(cfg.div_start)
+    win       = int(cfg.travel_window_steps)
+    div_fast  = int(cfg.travel_div_fast)
+    div_start = int(cfg.travel_start_div)
 
     if div_start < div_fast:
-        raise ValueError("Config error: div_start must be >= travel_div_fast")
+        div_start = div_fast
 
+    # If the segment is very short — use a simple triangular profile
     if N <= 2 * win:
-        # Triangular profile
         half = max(1, N // 2)
         emit_steps_accel(w, codes[:half], cfg.profile, div_fast, div_start)
         if N % 2 == 1:
@@ -388,12 +366,15 @@ def travel_ramped(w: StreamWriter, *args):
         emit_steps_decel(w, codes[half:], cfg.profile, div_fast, div_start)
         return
 
-    # Entry → cruise → exit
     entry = codes[:win]
     cruise = codes[win:N - win]
     exitc  = codes[N - win:]
 
-    emit_steps_accel(w, entry, cfg.profile, div_fast, div_start)
+    # Quantize speed levels for accel/decel
+    levels_down = _quantized_levels(div_start, div_fast, step=max(1, int(cfg.travel_quant_step)))
+    levels_up   = list(reversed(levels_down))
+
+    _emit_quantized_accel(w, entry, levels_down, cfg.profile)
     if cruise:
         w.set_speed(div_fast); w.add_steps(cruise)
-    emit_steps_decel(w, exitc, cfg.profile, div_fast, div_start)
+    _emit_quantized_decel(w, exitc, levels_up, cfg.profile)

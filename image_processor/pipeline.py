@@ -5,7 +5,7 @@ import os
 import sys
 import subprocess
 from dataclasses import asdict
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 # ----------------- config I/O -----------------
 def load_default_config():
@@ -52,7 +52,7 @@ def read_existing_config(outdir: str):
         return json.load(f)
 
 # ----------------- steps -----------------
-def module_path(preferred: str, fallback: str | None = None) -> str:
+def module_path(preferred: str, fallback: Optional[str] = None) -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     cand1 = os.path.join(here, preferred)
     if os.path.exists(cand1):

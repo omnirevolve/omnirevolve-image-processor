@@ -1,15 +1,14 @@
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict
 import os
-import json
 
 BGR = Tuple[int, int, int]
 
 
 @dataclass
 class Config:
-    # IO
+    # I/O
     input_image: str = "input.png"
     output_dir: str = "output"
     n_cores: int = 12
@@ -47,14 +46,21 @@ class Config:
     target_height_mm: int = 297
     pixels_per_mm: int = 40
 
+    # Internal page margins (default 10 mm each side).
+    # All downstream geometry (starting from scaling) is fitted into A4 minus these margins.
+    margin_left_mm: float = 10.0
+    margin_right_mm: float = 10.0
+    margin_top_mm: float = 10.0
+    margin_bottom_mm: float = 10.0
+
     # Pen geometry
-    pen_width_px: int = 60                 # 1.5 mm with 40 px/mm
+    pen_width_px: int = 60                 # ~1.5 mm with 40 px/mm
     pen_radius_px: int = 30                # convenience
 
     # Tap (dot) detection thresholds
     tap_max_area: float = 1200.0           # px^2
     tap_max_perimeter: float = 160.0       # px
-    tap_max_dim: int = 25                  # px bbox max dimension
+    tap_max_dim: int = 25                  # px (max bbox dimension)
     tap_merge_radius_px: int = 30          # px
 
     # Thinning / centerline (if used by any step)
@@ -79,6 +85,11 @@ class Config:
     # Debug helper: stop early after edge maps
     stop_after_edges: bool = False
 
+    # Stream color remap (optional)
+    stream_force_color_index: Optional[int] = None
+    stream_color_by_name: Optional[Dict[str, int]] = None
+    stream_color_by_order: Optional[List[int]] = None
+
     def ensure_output_dirs(self) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
         for name in self.color_names:
@@ -86,6 +97,7 @@ class Config:
 
 
 def _merge_defaults(base: dict, override: dict | None) -> dict:
+    """Shallow-merge helper: returns {**base, **override} (override may be None)."""
     out = dict(base)
     if override:
         out.update(override)
@@ -94,25 +106,27 @@ def _merge_defaults(base: dict, override: dict | None) -> dict:
 
 def load_config(path: str | None = None) -> Config:
     """
-    Load config JSON with this priority:
-      1) explicit path argument,
-      2) env CONFIG_PATH,
-      3) ./config.json.
-    Falls back to dataclass defaults if missing or invalid.
+    Load configuration from JSON (path or CONFIG_PATH env var). Unknown keys are ignored.
+    On failure, returns default Config().
     """
-    cfg_path = path or os.environ.get("CONFIG_PATH") or "config.json"
-    cfg_path = os.path.abspath(cfg_path)
-    print(f"[config] Loading config: {cfg_path} (exists={os.path.exists(cfg_path)})")
+    import json
+    p = path or os.environ.get("CONFIG_PATH")
+    if not p:
+        return Config()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[config] WARNING: failed to read JSON ({e}); using defaults.")
+        return Config()
 
-    defaults = asdict(Config())
+    # Keep only dataclass fields; ignore extras
+    fields = set(Config.__dataclass_fields__.keys())
+    known = {k: v for k, v in data.items() if k in fields}
 
-    if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            merged = _merge_defaults(defaults, data)
-            return Config(**merged)
-        except Exception as e:
-            print(f"[config] WARNING: failed to read JSON ({e}); using defaults.")
-
-    return Config(**defaults)
+    cfg = Config(**known)
+    # Convenience: stash raw JSON and source path
+    setattr(cfg, "_raw", data)
+    setattr(cfg, "_path", p)
+    print(f"[config] Loading config: {p} (exists=True)")
+    return cfg

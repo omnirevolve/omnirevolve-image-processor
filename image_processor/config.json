@@ -11,6 +11,13 @@
   ],
   "color_names": ["layer_light", "layer_skin", "layer_mid", "layer_dark"],
   "color_tolerance": 60,
+  
+  "stream_color_by_name": {
+    "layer_dark": 1,
+    "layer_mid": 0,
+    "layer_skin": 2,
+    "layer_light": 2
+  },
 
   "edge_low_threshold": 22,
   "edge_high_threshold": 70,

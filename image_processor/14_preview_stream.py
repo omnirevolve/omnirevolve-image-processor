@@ -1,84 +1,58 @@
-# 14_preview_stream.py
-# Wrapper: launch shared/xyplotter_stream_previewer.py on plot_stream.bin with proper canvas & palette.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+[14/14] Preview stream — launches the visualizer with canvas parameters from config/stream_meta.
+"""
 
 from __future__ import annotations
 import os
-import sys
 import json
 import subprocess
-from typing import Tuple, List
-
-import cv2  # only for target size fallback if needed (kept consistent with other steps)
-
-from config import load_config, Config
-
-def _target_size_px(cfg: Config) -> Tuple[int, int]:
-    tw = int(getattr(cfg, "target_width_px", 0) or 0)
-    th = int(getattr(cfg, "target_height_px", 0) or 0)
-    if tw > 0 and th > 0:
-        return tw, th
-    tw_mm = float(getattr(cfg, "target_width_mm", 0) or 0)
-    th_mm = float(getattr(cfg, "target_height_mm", 0) or 0)
-    ppm   = int(getattr(cfg, "pixels_per_mm", 0) or 0)
-    if tw_mm > 0 and th_mm > 0 and ppm > 0:
-        return int(round(tw_mm * ppm)), int(round(th_mm * ppm))
-    base = cv2.imread(os.path.join(cfg.output_dir, "resized.png"))
-    if base is None:
-        raise RuntimeError("Cannot infer target size; set target_* or run earlier steps.")
-    h, w = base.shape[:2]
-    return w, h
-
-def _palette_args(bgr_list: List[Tuple[int,int,int]]) -> List[str]:
-    # Previewer expects RGB; cfg.colors are BGR. Clamp to 4 entries.
-    args: List[str] = []
-    for i in range(min(4, len(bgr_list))):
-        b, g, r = bgr_list[i]
-        args += [f"--c{i}", f"{int(r)},{int(g)},{int(b)}"]
-    # Fill missing with defaults if fewer than 4 colors present
-    defaults = [(255,0,0),(0,255,0),(0,0,255),(0,0,0)]
-    for i in range(len(bgr_list), 4):
-        r,g,b = defaults[i]
-        args += [f"--c{i}", f"{r},{g},{b}"]
-    return args
+import sys
+from pathlib import Path
+from config import load_config
 
 def main():
-    cfg: Config = load_config()
-    outdir = cfg.output_dir
-    stream_path = os.path.join(outdir, "plot_stream.bin")
-    if not os.path.exists(stream_path):
-        raise SystemExit(f"[preview] Missing stream: {stream_path}. Run step 13 first.")
+    cfg = load_config()
+    outdir = Path(cfg.output_dir)
 
-    W, H = _target_size_px(cfg)
+    stream = outdir / "plot_stream.bin"
+    if not stream.exists():
+        raise SystemExit(f"[preview] ERROR: stream file not found: {stream}")
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    previewer = os.path.normpath(os.path.join(here, "..", "shared", "xyplotter_stream_previewer.py"))
-    if not os.path.exists(previewer):
-        raise SystemExit(f"[preview] Missing previewer script: {previewer}")
+    # Read canvas steps/inversion so the preview matches what goes to the plotter
+    meta_path = outdir / "stream_meta.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        W, H = meta.get("canvas_steps", [8400, 11880])
+        invert_y = 1 if meta.get("invert_y", True) else 0
+    else:
+        W = int(getattr(cfg, "target_width_mm", 210) * getattr(cfg, "steps_per_mm", 40))
+        H = int(getattr(cfg, "target_height_mm", 297) * getattr(cfg, "steps_per_mm", 40))
+        invert_y = 1  # default to mirrored Y like on the plotter
 
-    # Build CLI for previewer
-    argv = [
-        sys.executable, previewer,
-        stream_path,
+    # RGBK palette as a conventional mapping
+    palette = ["255,0,0", "0,255,0", "0,0,255", "0,0,0"]
+
+    cmd = [
+        sys.executable,
+        str((Path(__file__).resolve().parent / "../shared" / "omnirevolve_plotter_stream_previewer.py").resolve()),
+        str(stream),
         "--canvas-w-steps", str(W),
         "--canvas-h-steps", str(H),
-        "--invert-y", "1",
+        "--invert-y", str(invert_y),
         "--background-white", "1",
         "--render-taps", "1",
         "--tick-freq", "10000",
-        "--render-width", str(int(getattr(cfg, "preview_render_width_px", 1200))),
-        "--render-height", str(int(getattr(cfg, "preview_render_height_px", 900))),
-    ] + _palette_args(getattr(cfg, "colors", []))
+        "--render-width", "1200",
+        "--render-height", "900",
+        "--c0", palette[0], "--c1", palette[1], "--c2", palette[2], "--c3", palette[3],
+    ]
 
     print("[preview] launching previewer…")
-    print("[preview] cmd:", " ".join(argv))
-
-    # Forward stdout/stderr; interactive UI will open
+    print("[preview] cmd:", " ".join(cmd))
     env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    proc = subprocess.Popen(argv, env=env)
-    proc.wait()
-    if proc.returncode != 0:
-        raise SystemExit(f"[preview] previewer exited with code {proc.returncode}")
+    subprocess.run(cmd, env=env, check=False)
 
 if __name__ == "__main__":
     main()

@@ -1,284 +1,238 @@
-# 12_optimize_plot_order.py
-# Joint travel optimization: interleave polylines and taps per layer to minimize pen-up travel.
-# Inputs : <layer>/lines_cross.pkl, <layer>/taps_cross.pkl
-# Outputs: <layer>/plot_ops.pkl  (interleaved ops: [{"type":"line","points":...}|{"type":"tap","x":...,"y":...}])
-#          <output>/vector_manifest.json  (points to per-layer plot_ops.pkl)
-#
-# Algorithm:
-#   1) Build a candidate set of ops: lines (with reversible orientation) + taps (points).
-#   2) Greedy nearest-neighbor that chooses both next item and line orientation.
-#   3) Limited 2-opt on the interleaved sequence (segment-reversal with orientation flip inside).
-#      We accept a reversal only if it reduces the TOTAL route cost (safe but bounded by a pair limit).
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+12_optimize_plot_order.py — build drawing order (ops) for each layer.
+
+Input (strict):
+  <out>/<layer>/lines_cross.pkl
+  <out>/<layer>/taps_cross.pkl
+
+Output:
+  <out>/<layer>/ops.pkl  (list of operations with interleaved lines and taps)
+  <out>/vector_manifest.json
+
+Routing strategy (per layer):
+  • Polylines may be reversed (choose the endpoint closer to the current position).
+  • Start with the longest polyline to get a good seed.
+  • After each chosen operation, "drain" nearby taps within radius R_insert so we don't come back later.
+  • Then pick the next nearest operation (line/tap) and repeat.
+
+Assumes inputs are already cross-deduplicated.
+"""
 
 from __future__ import annotations
-import os, json, pickle, math
+import os
+import json
+import pickle
+import math
 from typing import List, Tuple, Dict, Any
+
 import numpy as np
 import cv2
 
 from config import load_config, Config
 
-# ---------------- size & color utils ----------------
 
-def _target_size_px(cfg: Config) -> Tuple[int,int]:
+# ------------------------------ utils ------------------------------
+
+def _target_size_px(cfg: Config) -> Tuple[int, int]:
     tw = int(getattr(cfg, "target_width_px", 0) or 0)
     th = int(getattr(cfg, "target_height_px", 0) or 0)
     if tw > 0 and th > 0:
         return tw, th
     tw_mm = float(getattr(cfg, "target_width_mm", 0) or 0)
     th_mm = float(getattr(cfg, "target_height_mm", 0) or 0)
-    ppm   = int(getattr(cfg, "pixels_per_mm", 0) or 0)
+    ppm = int(getattr(cfg, "pixels_per_mm", 0) or 0)
     if tw_mm > 0 and th_mm > 0 and ppm > 0:
         return int(round(tw_mm * ppm)), int(round(th_mm * ppm))
     base = cv2.imread(os.path.join(cfg.output_dir, "resized.png"))
     if base is None:
-        raise RuntimeError("Cannot infer target size.")
+        raise SystemExit("Cannot infer target size; run step 1.")
     h, w = base.shape[:2]
     return w, h
 
-def _color_index(cfg: Config, name: str) -> int:
-    try:
-        return list(cfg.color_names).index(name)
-    except ValueError:
-        return 0
 
-# ---------------- data model ----------------
-
-class Op:
-    __slots__ = ("kind", "pts", "xy", "flip")  # kind: "line"|"tap"
-    def __init__(self, kind: str, pts: np.ndarray | None = None, xy: Tuple[int,int] | None = None):
-        self.kind = kind
-        self.pts  = None
-        self.xy   = None
-        self.flip = False
-        if kind == "line":
-            p = np.asarray(pts).reshape(-1,2).astype(np.int32)
-            self.pts = p
-        elif kind == "tap":
-            x,y = xy
-            self.xy = (int(x), int(y))
-        else:
-            raise ValueError("Unknown op kind")
-
-    def start(self) -> Tuple[int,int]:
-        if self.kind == "tap":
-            return self.xy
-        if not self.flip:
-            a = self.pts[0]
-        else:
-            a = self.pts[-1]
-        return (int(a[0]), int(a[1]))
-
-    def end(self) -> Tuple[int,int]:
-        if self.kind == "tap":
-            return self.xy
-        if not self.flip:
-            b = self.pts[-1]
-        else:
-            b = self.pts[0]
-        return (int(b[0]), int(b[1]))
-
-    def oriented_points(self) -> np.ndarray:
-        if self.kind == "tap":
-            return np.empty((0,2), np.int32)
-        return (self.pts if not self.flip else self.pts[::-1]).astype(np.int32, copy=False)
-
-    def length(self) -> float:
-        if self.kind == "tap":
-            return 0.0
-        d = np.diff(self.pts.astype(np.float32), axis=0)
-        return float(np.hypot(d[:,0], d[:,1]).sum())
-
-# ---------------- I/O ----------------
-
-def _load_cross(layer_dir: str) -> Tuple[List[np.ndarray], List[Tuple[int,int]]]:
+def _load_cross(layer_dir: str) -> Tuple[List[np.ndarray], List[Tuple[int, int]]]:
     pL = os.path.join(layer_dir, "lines_cross.pkl")
     pT = os.path.join(layer_dir, "taps_cross.pkl")
-    if not (os.path.exists(pL) and os.path.exists(pT)):
-        raise RuntimeError(f"Missing cross-layer inputs in {layer_dir}")
-    with open(pL, "rb") as f: lines = pickle.load(f)
-    taps: List[Tuple[int,int]] = []
+    if not os.path.exists(pL) or not os.path.exists(pT):
+        raise SystemExit(f"Missing cross artifacts in {layer_dir}")
+    with open(pL, "rb") as f:
+        lines = pickle.load(f)
     with open(pT, "rb") as f:
-        obj = pickle.load(f)
-        for it in obj:
+        taps = []
+        for it in pickle.load(f):
             a = np.asarray(it).reshape(-1)
             if a.size >= 2:
                 taps.append((int(a[0]), int(a[1])))
     return lines, taps
 
-def _save_ops(layer_dir: str, ops: List[Op], color_name: str, color_idx: int) -> str:
-    packed_ops: List[Dict[str,Any]] = []
-    for op in ops:
-        if op.kind == "line":
-            packed_ops.append({"type":"line","points": op.oriented_points().astype(np.int32)})
-        else:
-            x,y = op.xy
-            packed_ops.append({"type":"tap","x":int(x),"y":int(y)})
-    out_path = os.path.join(layer_dir, "plot_ops.pkl")
-    with open(out_path, "wb") as f:
-        pickle.dump({
-            "color_name": color_name,
-            "color_idx": int(color_idx),
-            "ops": packed_ops
-        }, f)
-    return out_path
 
-# ---------------- geometry ----------------
+def _poly_len(pts: np.ndarray) -> float:
+    a = np.asarray(pts).reshape(-1, 2).astype(np.float32)
+    if a.shape[0] < 2:
+        return 0.0
+    d = a[1:] - a[:-1]
+    return float(np.sum(np.hypot(d[:, 0], d[:, 1])))
 
-def _d2(a: Tuple[int,int], b: Tuple[int,int]) -> float:
-    dx = float(a[0]-b[0]); dy = float(a[1]-b[1])
-    return dx*dx + dy*dy
 
-def _next_choice(cur: Tuple[int,int], op: Op) -> Tuple[float, bool, Tuple[int,int]]:
-    if op.kind == "tap":
-        d = _d2(cur, op.xy)
-        return d, False, op.xy
-    s, e = op.start(), op.end()
-    d_keep = _d2(cur, s)
-    d_flip = _d2(cur, e)
-    if d_flip < d_keep:
-        return d_flip, True, s  # if we flip, new end will be original start
+def _dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    return math.hypot(float(a[0] - b[0]), float(a[1] - b[1]))
+
+
+# ------------------------------ optimizer ------------------------------
+
+def _build_ops_for_layer(
+    lines: List[np.ndarray],
+    taps: List[Tuple[int, int]],
+    R_insert: float,
+) -> List[Dict[str, Any]]:
+    ops: List[Dict[str, Any]] = []
+
+    line_candidates = []
+    for i, c in enumerate(lines):
+        p = np.asarray(c).reshape(-1, 2).astype(np.float32)
+        if p.shape[0] < 2:
+            continue
+        line_candidates.append({
+            "i": i,
+            "points": p,
+            "start": (float(p[0, 0]), float(p[0, 1])),
+            "end": (float(p[-1, 0]), float(p[-1, 1])),
+            "len": _poly_len(p),
+        })
+    tap_candidates = [{"i": i, "pt": (float(x), float(y))} for i, (x, y) in enumerate(taps)]
+
+    if not line_candidates and not tap_candidates:
+        return ops
+
+    pos = (0.0, 0.0)
+
+    if line_candidates:
+        s = max(range(len(line_candidates)), key=lambda k: line_candidates[k]["len"])
+        first = line_candidates.pop(s)
+        if _dist(pos, first["end"]) < _dist(pos, first["start"]):
+            first["points"] = first["points"][::-1].copy()
+            first["start"], first["end"] = first["end"], first["start"]
+        ops.append({"type": "line", "points": first["points"]})
+        pos = first["end"]
+
+        kept = []
+        for t in tap_candidates:
+            if _dist(pos, t["pt"]) <= R_insert:
+                ops.append({"type": "tap", "x": int(round(t["pt"][0])), "y": int(round(t["pt"][1]))})
+                pos = t["pt"]
+            else:
+                kept.append(t)
+        tap_candidates = kept
     else:
-        return d_keep, False, e
+        s = min(range(len(tap_candidates)), key=lambda k: _dist(pos, tap_candidates[k]["pt"]))
+        first = tap_candidates.pop(s)
+        ops.append({"type": "tap", "x": int(round(first["pt"][0])), "y": int(round(first["pt"][1]))})
+        pos = first["pt"]
 
-def _route_cost(ops: List[Op]) -> float:
-    if len(ops) <= 1: return 0.0
-    cost = 0.0
-    cur_end = ops[0].end()
-    for i in range(1, len(ops)):
-        nxt_start = ops[i].start()
-        cost += math.hypot(cur_end[0]-nxt_start[0], cur_end[1]-nxt_start[1])
-        cur_end = ops[i].end()
-    return cost
+    while line_candidates or tap_candidates:
+        best_kind = None
+        best_idx = -1
+        best_cost = 1e20
+        best_flip = False
 
-# ---------------- optimization ----------------
+        for k in range(len(line_candidates)):
+            st = line_candidates[k]["start"]
+            en = line_candidates[k]["end"]
+            d1 = _dist(pos, st)
+            d2 = _dist(pos, en)
+            if d1 < best_cost:
+                best_cost = d1
+                best_kind = "L"
+                best_idx = k
+                best_flip = False
+            if d2 < best_cost:
+                best_cost = d2
+                best_kind = "L"
+                best_idx = k
+                best_flip = True
+        for k in range(len(tap_candidates)):
+            d = _dist(pos, tap_candidates[k]["pt"])
+            if d < best_cost:
+                best_cost = d
+                best_kind = "T"
+                best_idx = k
+                best_flip = False
 
-def _build_ops(lines: List[np.ndarray], taps: List[Tuple[int,int]]) -> List[Op]:
-    ops: List[Op] = [Op("line", pts=l) for l in lines] + [Op("tap", xy=t) for t in taps]
-    # stable order: keep relative cross-layer order as a weak prior (lines then taps),
-    # but greedy below will reorder anyway.
+        if best_kind == "L":
+            cur = line_candidates.pop(best_idx)
+            pts = cur["points"]
+            if best_flip:
+                pts = pts[::-1].copy()
+                cur_en = cur["start"]
+            else:
+                cur_en = cur["end"]
+            ops.append({"type": "line", "points": pts})
+            pos = cur_en
+
+            kept = []
+            for t in tap_candidates:
+                if _dist(pos, t["pt"]) <= R_insert:
+                    ops.append({"type": "tap", "x": int(round(t["pt"][0])), "y": int(round(t["pt"][1]))})
+                    pos = t["pt"]
+                else:
+                    kept.append(t)
+            tap_candidates = kept
+        else:
+            cur = tap_candidates.pop(best_idx)
+            ops.append({"type": "tap", "x": int(round(cur["pt"][0])), "y": int(round(cur["pt"][1]))})
+            pos = cur["pt"]
+
     return ops
 
-def _greedy_interleaved(ops: List[Op]) -> List[Op]:
-    if not ops: return []
-    used = np.zeros(len(ops), dtype=bool)
-    # start from the longest line if exists, else from the first tap
-    start_idx = int(np.argmax([op.length() for op in ops]))
-    if ops[start_idx].kind == "tap":
-        # find any line; else keep tap
-        idx_line = next((i for i,op in enumerate(ops) if op.kind=="line"), start_idx)
-        start_idx = idx_line
-    used[start_idx] = True
-    seq: List[Op] = []
-    # choose best orientation for the start line (flip if end farther from overall centroid)
-    op0 = ops[start_idx]
-    if op0.kind == "line":
-        # heuristic: make the longer "tail" go forward by pointing to the farther endpoint from centroid
-        pts = op0.pts
-        cx, cy = float(np.mean(pts[:,0])), float(np.mean(pts[:,1]))
-        d0 = _d2((int(pts[0,0]),int(pts[0,1])), (int(cx),int(cy)))
-        d1 = _d2((int(pts[-1,0]),int(pts[-1,1])), (int(cx),int(cy)))
-        op0.flip = (d1 < d0)
-    seq.append(op0)
-    cur = op0.end()
 
-    while not np.all(used):
-        best_i = -1; best_flip = False; best_d = 1e30; best_exit = cur
-        for i, op in enumerate(ops):
-            if used[i]: continue
-            d, flip, nxt_end = _next_choice(cur, op)
-            if d < best_d:
-                best_d = d; best_i = i; best_flip = flip; best_exit = nxt_end
-        ops[best_i].flip = (ops[best_i].flip ^ best_flip) if ops[best_i].kind=="line" else False
-        used[best_i] = True
-        seq.append(ops[best_i])
-        cur = best_exit
-    return seq
-
-def _two_opt_limited(seq: List[Op], max_pairs: int, max_passes: int, tol: float=1e-6) -> List[Op]:
-    n = len(seq)
-    if n < 4 or max_pairs <= 0 or max_passes <= 0:
-        return seq
-    total = _route_cost(seq)
-    pairs_tried = 0
-    improved_any = True
-    passes = 0
-    while improved_any and passes < max_passes and pairs_tried < max_pairs:
-        improved_any = False
-        passes += 1
-        for i in range(0, n-3):
-            for j in range(i+2, n-1):
-                if pairs_tried >= max_pairs:
-                    break
-                pairs_tried += 1
-                # try reversing [i+1 : j]
-                # save state
-                old_block = seq[i+1:j+1]
-                # flip orientations inside the block because execution order flips
-                for op in old_block:
-                    if op.kind == "line":
-                        op.flip = not op.flip
-                seq[i+1:j+1] = old_block[::-1]
-                new_total = _route_cost(seq)
-                if new_total + tol < total:
-                    total = new_total
-                    improved_any = True
-                else:
-                    # revert
-                    seq[i+1:j+1] = old_block[::-1]  # reverse back
-                    for op in old_block:
-                        if op.kind == "line":
-                            op.flip = not op.flip
-        # loop again if improved
-    return seq
-
-# ---------------- manifest ----------------
-
-def _save_manifest(outdir: str, W: int, H: int, layers: List[Dict[str,Any]]) -> str:
-    man = {"image_size":[int(W),int(H)], "layers": layers}
-    dst = os.path.join(outdir, "vector_manifest.json")
-    with open(dst, "w", encoding="utf-8") as f:
-        json.dump(man, f, indent=2, ensure_ascii=False)
-    return dst
-
-# ---------------- main ----------------
+# ------------------------------ I/O & main ------------------------------
 
 def main():
     cfg: Config = load_config()
-    outdir = cfg.output_dir
+    out = cfg.output_dir
     W, H = _target_size_px(cfg)
 
-    # tunables (safe defaults)
-    two_opt_pairs   = int(getattr(cfg, "plotopt_two_opt_pairs", 2000))
-    two_opt_passes  = int(getattr(cfg, "plotopt_two_opt_passes", 2))
+    R_insert = float(getattr(cfg, "plotopt_tap_insert_radius_px", max(80.0, getattr(cfg, "pen_width_px", 60))))
 
-    layers_meta: List[Dict[str,Any]] = []
-
+    layers = []
     for name in cfg.color_names:
-        layer_dir = os.path.join(outdir, name)
-        if not os.path.isdir(layer_dir):
-            raise RuntimeError(f"Missing layer dir: {layer_dir}")
-
+        layer_dir = os.path.join(out, name)
+        os.makedirs(layer_dir, exist_ok=True)
         lines, taps = _load_cross(layer_dir)
-        ops0 = _build_ops(lines, taps)
-        seq  = _greedy_interleaved(ops0)
-        seq  = _two_opt_limited(seq, max_pairs=two_opt_pairs, max_passes=two_opt_passes)
+        ops = _build_ops_for_layer(lines, taps, R_insert)
 
-        out_pkl = _save_ops(layer_dir, seq, name, _color_index(cfg, name))
-        layers_meta.append({
+        p_ops = os.path.join(layer_dir, "ops.pkl")
+        with open(p_ops, "wb") as f:
+            pickle.dump(ops, f)
+
+        if "dark" in name:
+            color_idx = 3
+        elif "skin" in name:
+            color_idx = 0
+        elif "mid" in name:
+            color_idx = 1
+        elif "light" in name:
+            color_idx = 2
+        else:
+            color_idx = 0
+
+        layers.append({
+            "name": name,
             "color_name": name,
-            "color_index": _color_index(cfg, name),
-            "file": os.path.relpath(out_pkl, outdir).replace("\\","/"),
-            "stats": {
-                "ops": len(seq),
-                "lines": sum(1 for op in seq if op.kind=="line"),
-                "taps":  sum(1 for op in seq if op.kind=="tap"),
-            }
+            "color_index": color_idx,
+            "file": os.path.relpath(p_ops, out),
+            "count_ops": len(ops),
         })
-        print(f"[plot-opt] {name}: ops={len(seq)} (lines={layers_meta[-1]['stats']['lines']}, taps={layers_meta[-1]['stats']['taps']})")
+        nL = sum(1 for o in ops if o["type"] == "line")
+        nT = sum(1 for o in ops if o["type"] == "tap")
+        print(f"[plot-opt] {name}: ops={len(ops)} (lines={nL}, taps={nT})")
 
-    man_path = _save_manifest(outdir, W, H, layers_meta)
-    print(f"[plot-opt] manifest saved: {man_path}")
+    manifest = {"image_size": [W, H], "layers": layers, "coords": "pixel_top_left"}
+    with open(os.path.join(out, "vector_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    print(f"[plot-opt] manifest saved: {os.path.join(out, 'vector_manifest.json')}")
 
 if __name__ == "__main__":
     main()

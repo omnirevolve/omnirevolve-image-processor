@@ -18,18 +18,12 @@ from pathlib import Path
 from typing import List, Tuple, Iterable
 import argparse
 import json
-import sys
 
 from matplotlib.textpath import TextPath
 from matplotlib.font_manager import FontProperties
 
-# helpers (protocol/profiles) — project renamed to omnirevolve_plotter
-# helpers are located in ../../shared
-_SHARED_DIR = (Path(__file__).resolve().parent / "../../shared").resolve()
-if str(_SHARED_DIR) not in sys.path:
-    sys.path.insert(0, str(_SHARED_DIR))
-
-from omnirevolve_plotter_stream_creator_helper import (
+# helpers (protocol/profiles)
+from xyplotter_stream_creator_helper import (
     Config as HWConfig,
     StreamWriter,
     travel_ramped,
@@ -478,10 +472,9 @@ def generate_demo_stream(output_file: str = "demo_stream.bin"):
     }
     Path(output_file).with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    previewer = str(_SHARED_DIR / "omnirevolve_plotter_stream_previewer.py")
     print("✓ Stream saved:", output_file)
     print("  Size:", len(stream), "bytes")
-    print(f"\nPreview:\n  python3 {previewer} --canvas-w-steps {CANVAS_W} --canvas-h-steps {CANVAS_H} --invert-y {1 if INVERT_Y else 0} {output_file}")
+    print(f"\nPreview:\n  python3 shared/xyplotter_stream_previewer.py --canvas-w-steps {CANVAS_W} --canvas-h-steps {CANVAS_H} --invert-y {1 if INVERT_Y else 0} {output_file}")
 
 
 def main():

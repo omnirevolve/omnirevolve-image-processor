@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xyplotter_stream_creator.py — build a single NEW-protocol stream from vector layers.
+omnirevolve_plotter_stream_creator.py — build a single NEW-protocol stream from vector layers.
 
 Reads a vector manifest (JSON) with per-layer pickles, converts them into
 plotter steps, and emits a binary stream using the shared motion/encoding
-engine from xyplotter_stream_creator_helper.py.
+engine from omnirevolve_plotter_stream_creator_helper.py.
 
-Key points:
-- Pen-up travels use fixed-window accel/decel (configurable).
-- Pen-down polylines are corner-aware (slow-in/out at sharp angles).
-- Service bytes (speed/pen/color/EOF) and step packing are handled by the helper.
+Key defaults:
+- Faster defaults (div_start=28, div_fast=15, corner_div=28, window=300).
+- Short-edge logic is handled in the helper.
 """
 
 from __future__ import annotations
@@ -19,11 +18,17 @@ import json
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional
+import sys
 
 import numpy as np
 
-from xyplotter_stream_creator_helper import (
+# helpers (protocol/profiles) — project: omnirevolve_plotter; helpers are in ../../shared
+_SHARED_DIR = (Path(__file__).resolve().parent / "../../shared").resolve()
+if str(_SHARED_DIR) not in sys.path:
+    sys.path.insert(0, str(_SHARED_DIR))
+
+from omnirevolve_plotter_stream_creator_helper import (  # type: ignore
     Config,
     StreamWriter,
     emit_polyline,
@@ -50,9 +55,8 @@ def _ensure_xy(contour) -> np.ndarray:
         pts = pts.reshape(-1, 2)
     return pts.astype(np.float64, copy=False)
 
-
 def _finalize_point(x: float, y: float, invert_y: bool, tgt_w: int, tgt_h: int) -> Tuple[int, int]:
-    """To integer steps inside canvas; optional Y inversion for top-left previews."""
+    """Clamp to integer steps inside canvas; optional Y inversion for top-left previews."""
     xi = int(round(x))
     yi = int(round(y))
     if invert_y:
@@ -60,7 +64,6 @@ def _finalize_point(x: float, y: float, invert_y: bool, tgt_w: int, tgt_h: int) 
     xi = max(0, min(tgt_w - 1, xi))
     yi = max(0, min(tgt_h - 1, yi))
     return xi, yi
-
 
 def _contour_to_steps(contour: np.ndarray, invert_y: bool, tgt_w: int, tgt_h: int) -> np.ndarray:
     pts = _ensure_xy(contour)
@@ -71,13 +74,12 @@ def _contour_to_steps(contour: np.ndarray, invert_y: bool, tgt_w: int, tgt_h: in
         out[i, 0], out[i, 1] = _finalize_point(x, y, invert_y, tgt_w, tgt_h)
     return out
 
-
 def _load_vector_layers(manifest_path: Path, invert_y: bool, target_w_steps: int, target_h_steps: int) -> List[LayerInfo]:
     """Load layers from manifest; each layer file is a pickle with 'contours' and 'taps'."""
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     mw, mh = map(int, manifest.get("image_size", [target_w_steps, target_h_steps]))
     if (mw, mh) != (target_w_steps, target_h_steps):
-        raise ValueError(f"Canvas mismatch: manifest {mw}x{mh} != target {target_w_steps}x{target_h_steps}")
+        print(f"[stream] WARN: manifest size {manifest.get('image_size')} != target {target_w_steps}x{target_h_steps}")
 
     base_dir = manifest_path.parent
     layers: List[LayerInfo] = []
@@ -112,10 +114,8 @@ def _load_vector_layers(manifest_path: Path, invert_y: bool, target_w_steps: int
             total_length_steps=total_len,
         ))
 
-    # Draw layers in deterministic color order
     layers.sort(key=lambda L: L.color_index)
     return layers
-
 
 # ------------------------------- Core logic --------------------------------
 
@@ -123,6 +123,7 @@ def _generate_stream(manifest_path: Path, output_file: Path,
                      target_w_steps: int, target_h_steps: int, cfg: Config) -> None:
     w = StreamWriter()
     w.pen_up()
+    w.set_speed(cfg.div_start)
 
     layers = _load_vector_layers(manifest_path, cfg.invert_y, target_w_steps, target_h_steps)
 
@@ -143,7 +144,7 @@ def _generate_stream(manifest_path: Path, output_file: Path,
 
         w.select_color(L.color_index)
 
-        # Contours (corner-aware)
+        # Contours
         for cs in L.contours_steps:
             start = (int(cs[0, 0]), int(cs[0, 1]))
             if (cur_x, cur_y) != start:
@@ -180,7 +181,6 @@ def _generate_stream(manifest_path: Path, output_file: Path,
     print("  Size:", len(data), "bytes")
     print("  Layers:", len(layers), "Contours:", total_contours, "Taps:", total_taps)
 
-
 # ---------------------------------- CLI ------------------------------------
 
 def _locate_manifest(arg: str) -> Path:
@@ -196,7 +196,6 @@ def _locate_manifest(arg: str) -> Path:
             return cand
     raise FileNotFoundError(f"Cannot find vector_manifest.json in {arg}")
 
-
 def main():
     ap = argparse.ArgumentParser(
         description="Generate a NEW-protocol binary stream from vector layers (color-batched)."
@@ -206,25 +205,30 @@ def main():
     ap.add_argument("--target-width-steps", type=int, required=True)
     ap.add_argument("--target-height-steps", type=int, required=True)
 
-    # Motion/kinematics (aligned with xyplotter_stream_creator_helper.Config)
+    # Motion/kinematics (aligned with omnirevolve_plotter_stream_creator_helper.Config)
     ap.add_argument("--steps-per-mm", type=float, default=40.0)
     ap.add_argument("--invert-y", type=int, default=1)
 
-    # Drawing (pen-down) profile
-    ap.add_argument("--div-start", type=int, default=64,
+    # Drawing (pen-down) profile — fast defaults
+    ap.add_argument("--div-start", type=int, default=28,
                     help="Start/stop divider (slow end) for drawing/travel")
-    ap.add_argument("--div-fast", type=int, default=20,
+    ap.add_argument("--div-fast", type=int, default=15,
                     help="Drawing cruise divider")
     ap.add_argument("--profile", choices=["triangle", "scurve"], default="triangle")
     ap.add_argument("--corner-deg", type=float, default=85.0)
-    ap.add_argument("--corner-div", type=int, default=64,
+    ap.add_argument("--corner-div", type=int, default=28,
                     help="Divider near sharp corners and as accel/decel endpoint")
-    ap.add_argument("--corner-window-steps", type=int, default=800,
-                    help="Fixed accel/decel window length in steps (~2 cm @ 40 steps/mm)")
+    ap.add_argument("--corner-window-steps", type=int, default=300,
+                    help="Fixed accel/decel window length in steps (~7.5 mm @ 40 steps/mm)")
 
     # Pen-up travel cruise
     ap.add_argument("--travel-div-fast", type=int, default=10,
                     help="Pen-up cruise divider (must be <= div-start)")
+
+    # Short edges (no-corner)
+    ap.add_argument("--short-len-steps", type=int, default=120,
+                    help="Edges shorter than this (no corner) draw at constant short-div")
+    ap.add_argument("--short-div", type=int, default=16)
 
     args = ap.parse_args()
 
@@ -244,10 +248,11 @@ def main():
         corner_deg=args.corner_deg,
         corner_div=args.corner_div,
         corner_window_steps=args.corner_window_steps,
+        short_len_steps=args.short_len_steps,
+        short_div=args.short_div,
     )
 
     _generate_stream(mp, Path(args.output), args.target_width_steps, args.target_height_steps, cfg)
-
 
 if __name__ == "__main__":
     main()
