@@ -3,29 +3,26 @@
 """
 omnirevolve_plotter_gcode_stream_creator.py — G-code → OmniRevolve NEW-protocol stream.
 
-Uses your shared helper module:
-    omnirevolve_plotter_stream_creator_helper.py
-
-Supported G-code subset:
-  - G0  : rapid move (pen-up travel_ramped)
-  - G1  : linear move
-  - G90 : absolute coordinates (default)
-  - G91 : relative coordinates
-  - G21 : millimeters (default)
-  - G20 : inches (converted to mm)
-  - M3/M4 : pen down
-  - M5    : pen up
-  - Z     : Z > 0 → pen up, Z <= 0 → pen down
-            (unless explicitly overridden by M-codes)
+Features:
+  - Parses a simple G-code subset (G0/G1, G90/G91, G20/G21, M3/M4/M5, X/Y).
+  - Extracts all pen-down polylines in millimeters.
+  - Converts them to step coordinates (A4 @ 40 steps/mm by default).
+  - Optionally reorders polylines with a nearest-neighbor heuristic.
+  - Draws contours using the same emit_polyline() corner-aware engine
+    as the original omnirevolve_plotter_stream_creator.py.
+  - Supports a global speed scale factor (similar to 3D-printer feed rate):
+      * --speed-scale > 1.0 → faster (smaller dividers)
+      * --speed-scale < 1.0 → slower (larger dividers)
 
 Defaults:
-  - A4 (210x297 mm)
-  - 40 steps/mm
-  - target canvas: 8400 x 11880 steps
-  - single color (color_index = 3, black)
+  - Target page: A4 210x297 mm
+  - steps_per_mm: 40
+  - canvas: 8400 x 11880 steps
+  - single color: index 3 (black)
 """
 
 from __future__ import annotations
+
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,8 +43,8 @@ if str(_SHARED_DIR) not in sys.path:
 from omnirevolve_plotter_stream_creator_helper import (  # type: ignore
     Config,
     StreamWriter,
-    emit_polyline,
     travel_ramped,
+    emit_polyline,
 )
 
 Point = Tuple[int, int]
@@ -63,7 +60,6 @@ class GCodeState:
     absolute: bool = True     # G90 / G91
     units_in_mm: bool = True  # G21 / G20
     pen_down: bool = False
-    current_g: int = 0        # modal: 0 (rapid) or 1 (linear)
 
 
 # ------------------------- Utilities -------------------------
@@ -92,6 +88,13 @@ def mm_to_steps(
     scale_x: float = 1.0,
     scale_y: float = 1.0,
 ) -> Point:
+    """
+    Map physical coordinates (mm) into step-space.
+
+    Note:
+      - invert_y applies a simple flip around the vertical center of the canvas.
+      - offsets and scales are applied in mm-space before conversion to steps.
+    """
     x_mm_adj = x_mm * scale_x + offset_x_mm
     y_mm_adj = y_mm * scale_y + offset_y_mm
 
@@ -139,60 +142,67 @@ def parse_gcode_file(path: Path) -> List[str]:
     return lines
 
 
-# ---------------------- Core: G-code → stream ----------------------
+# ---------------------- Nearest-neighbor ordering ----------------------
 
-def generate_stream_from_gcode(
+def _dist_l1(a: Point, b: Point) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def order_paths_nearest(paths: List[List[Point]], start_xy: Point) -> List[List[Point]]:
+    """
+    Reorder polylines to minimize travel distance using a simple
+    nearest-neighbor heuristic.
+    """
+    remaining = [p for p in paths if len(p) >= 2]
+    ordered: List[List[Point]] = []
+    cur = start_xy
+
+    while remaining:
+        best_i = 0
+        best_d = 10**18
+        for i, p in enumerate(remaining):
+            d = _dist_l1(cur, p[0])
+            if d < best_d:
+                best_d = d
+                best_i = i
+        chosen = remaining.pop(best_i)
+        ordered.append(chosen)
+        cur = chosen[-1]
+
+    return ordered
+
+
+# ---------------------- Core: G-code → polylines (mm) ----------------------
+
+def extract_polylines_mm(
     gcode_path: Path,
-    output_file: Path,
-    cfg: Config,
-    target_w_steps: int,
-    target_h_steps: int,
-    color_index: int = 3,
-    offset_x_mm: float = 0.0,
-    offset_y_mm: float = 0.0,
-    scale_x: float = 1.0,
-    scale_y: float = 1.0,
-) -> None:
+) -> Tuple[List[List[Tuple[float, float]]], int]:
+    """
+    Parse G-code and extract all pen-down polylines in millimeters.
+
+    Returns:
+        (paths_mm, pen_down_moves)
+    where paths_mm is a list of polylines (each a list of (x_mm, y_mm)).
+    """
     lines = parse_gcode_file(gcode_path)
-    print(f"[gcode] File: {gcode_path}, lines: {len(lines)}")
-
     st = GCodeState()
-    w = StreamWriter()
-    w.pen_up()
-    w.set_speed(cfg.div_start)
-    w.select_color(color_index)
 
-    cur_x_steps, cur_y_steps = mm_to_steps(
-        st.x_mm,
-        st.y_mm,
-        cfg.steps_per_mm,
-        target_w_steps,
-        target_h_steps,
-        cfg.invert_y,
-        offset_x_mm,
-        offset_y_mm,
-        scale_x,
-        scale_y,
-    )
+    paths_mm: List[List[Tuple[float, float]]] = []
+    current_path: List[Tuple[float, float]] = []
 
-    current_poly: List[Point] = []
+    def close_current_path():
+        nonlocal current_path
+        if len(current_path) >= 2:
+            paths_mm.append(current_path)
+        current_path = []
 
-    def flush_poly():
-        nonlocal current_poly
-        if len(current_poly) >= 2:
-            w.pen_down()
-            emit_polyline(w, cfg, current_poly, color_index=None)
-            w.pen_up()
-        current_poly = []
-
-    moves_count = 0
+    pen_down_moves = 0
 
     for lineno, line in enumerate(lines, start=1):
         tokens = line.split()
         if not tokens:
             continue
 
-        new_g: Optional[int] = None
         new_pen_down: Optional[bool] = None
         new_x_val: Optional[float] = None
         new_y_val: Optional[float] = None
@@ -213,9 +223,7 @@ def generate_stream_from_gcode(
                     gcode_num = int(float(val_str))
                 except ValueError:
                     continue
-                if gcode_num in (0, 1):
-                    new_g = gcode_num
-                elif gcode_num == 90:
+                if gcode_num == 90:
                     st.absolute = True
                 elif gcode_num == 91:
                     st.absolute = False
@@ -244,28 +252,16 @@ def generate_stream_from_gcode(
                     v = float(val_str)
                 except ValueError:
                     continue
+                if not st.units_in_mm:
+                    v *= INCH_TO_MM
                 if cmd == 'X':
                     new_x_val = v
                 elif cmd == 'Y':
                     new_y_val = v
-                elif cmd == 'Z':
+                else:
                     new_z_val = v
 
-        # Convert coordinates to mm if units = inches (G20)
-        def to_mm(v: Optional[float]) -> Optional[float]:
-            if v is None:
-                return None
-            return v if st.units_in_mm else v * INCH_TO_MM
-
-        new_x_val = to_mm(new_x_val)
-        new_y_val = to_mm(new_y_val)
-        new_z_val = to_mm(new_z_val)
-
-        # Apply modal G0/G1
-        if new_g is not None:
-            st.current_g = new_g
-
-        # Update Z and optionally pen state from Z
+        # Z is unused here (no Z in your papapishu file), but left for completeness
         if new_z_val is not None:
             st.z_mm = new_z_val
             # If M-code did not explicitly override, infer from Z:
@@ -275,12 +271,14 @@ def generate_stream_from_gcode(
         # Apply pen up/down if it changed
         if new_pen_down is not None and new_pen_down != st.pen_down:
             if st.pen_down and not new_pen_down:
-                flush_poly()
+                close_current_path()
             st.pen_down = new_pen_down
 
         # X/Y motion
         move_involved = (new_x_val is not None) or (new_y_val is not None)
         if move_involved:
+            old_x, old_y = st.x_mm, st.y_mm
+
             if st.absolute:
                 if new_x_val is not None:
                     st.x_mm = new_x_val
@@ -292,9 +290,39 @@ def generate_stream_from_gcode(
                 if new_y_val is not None:
                     st.y_mm += new_y_val
 
-            new_x_steps, new_y_steps = mm_to_steps(
-                st.x_mm,
-                st.y_mm,
+            if st.pen_down:
+                if not current_path:
+                    current_path = [(old_x, old_y)]
+                current_path.append((st.x_mm, st.y_mm))
+                pen_down_moves += 1
+
+    close_current_path()
+    return paths_mm, pen_down_moves
+
+
+# ---------------------- mm polylines → step polylines ----------------------
+
+def convert_polylines_to_steps(
+    paths_mm: List[List[Tuple[float, float]]],
+    cfg: Config,
+    target_w_steps: int,
+    target_h_steps: int,
+    offset_x_mm: float,
+    offset_y_mm: float,
+    scale_x: float,
+    scale_y: float,
+) -> List[List[Point]]:
+    out: List[List[Point]] = []
+
+    for poly_mm in paths_mm:
+        if len(poly_mm) < 2:
+            continue
+        step_poly: List[Point] = []
+        last: Optional[Point] = None
+        for x_mm, y_mm in poly_mm:
+            xs, ys = mm_to_steps(
+                x_mm,
+                y_mm,
                 cfg.steps_per_mm,
                 target_w_steps,
                 target_h_steps,
@@ -304,35 +332,103 @@ def generate_stream_from_gcode(
                 scale_x,
                 scale_y,
             )
+            if last is None or last != (xs, ys):
+                step_poly.append((xs, ys))
+                last = (xs, ys)
+        if len(step_poly) >= 2:
+            out.append(step_poly)
 
-            if (new_x_steps, new_y_steps) == (cur_x_steps, cur_y_steps):
-                continue
+    return out
 
-            moves_count += 1
 
-            # G0 or pen-up → travel_ramped
-            if st.current_g == 0 or not st.pen_down:
-                flush_poly()
-                w.pen_up()
-                travel_ramped(w, cur_x_steps, cur_y_steps, new_x_steps, new_y_steps, cfg)
-                cur_x_steps, cur_y_steps = new_x_steps, new_y_steps
-            else:
-                # G1 with pen-down → accumulate polyline
-                if not current_poly:
-                    current_poly = [(cur_x_steps, cur_y_steps)]
-                current_poly.append((new_x_steps, new_y_steps))
-                cur_x_steps, cur_y_steps = new_x_steps, new_y_steps
+# ---------------------- Stream generator ----------------------
 
-    # Flush last polyline
-    flush_poly()
+def generate_stream_from_gcode(
+    gcode_path: Path,
+    output_file: Path,
+    cfg: Config,
+    target_w_steps: int,
+    target_h_steps: int,
+    color_index: int,
+    offset_x_mm: float,
+    offset_y_mm: float,
+    scale_x: float,
+    scale_y: float,
+    reorder: bool,
+) -> None:
+    # 1) Extract polylines in millimeters
+    paths_mm, pen_moves = extract_polylines_mm(gcode_path)
+    print(f"[gcode] File: {gcode_path}")
+    print(f"[gcode] Pen-down polylines (mm): {len(paths_mm)}, pen-down moves: {pen_moves}")
+
+    if not paths_mm:
+        print("[gcode] No pen-down paths found — emitting empty stream.")
+        w_empty = StreamWriter()
+        data_empty = w_empty.finalize()
+        output_file.write_bytes(data_empty)
+        print("✓ Stream saved (empty).")
+        return
+
+    # 2) Convert to step-space
+    paths_steps = convert_polylines_to_steps(
+        paths_mm=paths_mm,
+        cfg=cfg,
+        target_w_steps=target_w_steps,
+        target_h_steps=target_h_steps,
+        offset_x_mm=offset_x_mm,
+        offset_y_mm=offset_y_mm,
+        scale_x=scale_x,
+        scale_y=scale_y,
+    )
+    print(f"[gcode] Step-space polylines: {len(paths_steps)}")
+
+    if not paths_steps:
+        print("[gcode] All paths collapsed or out of canvas — empty stream.")
+        w_empty = StreamWriter()
+        data_empty = w_empty.finalize()
+        output_file.write_bytes(data_empty)
+        print("✓ Stream saved (empty).")
+        return
+
+    # 3) Optional nearest-neighbor reordering
+    if reorder:
+        ordered_paths = order_paths_nearest(paths_steps, start_xy=(0, 0))
+    else:
+        ordered_paths = paths_steps
+
+    # 4) Build stream using emit_polyline for drawing
+    w = StreamWriter()
+    w.pen_up()
+    w.set_speed(cfg.div_start)
+    w.select_color(color_index)
+
+    cur_x, cur_y = 0, 0
+
+    for path in ordered_paths:
+        if len(path) < 2:
+            continue
+
+        start = path[0]
+        end = path[-1]
+
+        # Travel (pen up) to the start of this polyline
+        if (cur_x, cur_y) != start:
+            travel_ramped(w, cur_x, cur_y, start[0], start[1], cfg)
+            cur_x, cur_y = start
+
+        # Draw the polyline with the corner-aware engine
+        w.pen_down()
+        emit_polyline(w, cfg, path, color_index=None)
+        w.pen_up()
+        cur_x, cur_y = end
 
     data = w.finalize()
     output_file.write_bytes(data)
 
     print("✓ Stream saved:", str(output_file))
     print("  Size:", len(data), "bytes")
-    print("  Moves:", moves_count)
-    print(f"  Target steps: {target_w_steps} x {target_h_steps}, steps/mm={cfg.steps_per_mm}")
+    print("  Paths:", len(ordered_paths))
+    print("  Target steps: %d x %d, steps/mm=%.3f" % (target_w_steps, target_h_steps, cfg.steps_per_mm))
 
 
 # ------------------------------- CLI ---------------------------------
@@ -354,13 +450,13 @@ def build_argparser() -> argparse.ArgumentParser:
         "--target-width-steps",
         type=int,
         default=None,
-        help="Canvas width in steps; default: A4_w_mm * steps_per_mm",
+        help="Canvas width in steps; default: A4_width_mm * steps_per_mm",
     )
     ap.add_argument(
         "--target-height-steps",
         type=int,
         default=None,
-        help="Canvas height in steps; default: A4_h_mm * steps_per_mm",
+        help="Canvas height in steps; default: A4_height_mm * steps_per_mm",
     )
 
     ap.add_argument(
@@ -373,10 +469,10 @@ def build_argparser() -> argparse.ArgumentParser:
         "--invert-y",
         type=int,
         default=0,
-        help="Invert Y axis (1/0), default: 0",
+        help="Invert Y axis in generator (1/0). Default: 0 (no flip).",
     )
 
-    # Simple affine transform (if you want to shift/scale the G-code)
+    # Affine transform (shift/scale G-code geometry in mm)
     ap.add_argument(
         "--offset-x-mm",
         type=float,
@@ -410,7 +506,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Pen/color index (0..7), default: 3 (black)",
     )
 
-    # Motion profile — same defaults as in your other scripts
+    # Motion profile — same fields as Config in helper
     ap.add_argument("--div-start", type=int, default=28)
     ap.add_argument("--div-fast", type=int, default=15)
     ap.add_argument("--profile", choices=["triangle", "scurve"], default="triangle")
@@ -426,15 +522,77 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--short-len-steps", type=int, default=120)
     ap.add_argument("--short-div", type=int, default=16)
 
+    # Global speed scale
+    ap.add_argument(
+        "--speed-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Global speed multiplier for all motion dividers. "
+            ">1.0 = faster (smaller dividers), <1.0 = slower. Default: 1.0"
+        ),
+    )
+
+    # Path reordering
+    ap.add_argument(
+        "--no-reorder",
+        action="store_true",
+        help="Disable nearest-neighbor reordering of polylines.",
+    )
+
     return ap
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def apply_speed_scale(args: argparse.Namespace) -> argparse.Namespace:
+    """
+    Apply global speed scaling to all divider-related arguments.
+
+    Divider is an inverse speed: smaller divider → faster.
+    For speed_scale > 1.0, we reduce divisors; for <1.0, increase.
+    """
+    scale = float(args.speed_scale)
+    if scale <= 0.0:
+        raise SystemExit("Error: --speed-scale must be > 0")
+
+    if abs(scale - 1.0) < 1e-6:
+        # No scaling needed
+        return args
+
+    def scale_div(v: int) -> int:
+        new_v = int(round(v / scale))
+        if new_v < 1:
+            new_v = 1
+        return new_v
+
+    args.div_start = scale_div(args.div_start)
+    args.div_fast = scale_div(args.div_fast)
+    args.corner_div = scale_div(args.corner_div)
+    args.short_div = scale_div(args.short_div)
+
+    args.travel_div_fast = scale_div(args.travel_div_fast)
+    args.travel_start_div = scale_div(args.travel_start_div)
+
+    # Constraints
+    if args.div_start < args.div_fast:
+        args.div_start = args.div_fast
+    if args.corner_div < args.div_fast:
+        args.corner_div = args.div_fast
+    if args.short_div < args.div_fast:
+        args.short_div = args.div_fast
+    if args.travel_start_div < args.travel_div_fast:
+        args.travel_start_div = args.travel_div_fast
+    if args.div_start < args.travel_div_fast:
+        args.div_start = args.travel_div_fast
+
+    return args
+
+
+def main(argv: Optional[List[str]] = None) -> None:
     ap = build_argparser()
     args = ap.parse_args(argv)
 
-    if args.div_start < args.travel_div_fast:
-        raise SystemExit("Error: --div-start must be >= --travel-div-fast")
+    # Apply global speed scaling to divider-related args
+    args = apply_speed_scale(args)
 
     # A4 defaults if target size not provided
     if args.target_width_steps is None or args.target_height_steps is None:
@@ -444,6 +602,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         target_w_steps = args.target_width_steps
         target_h_steps = args.target_height_steps
 
+    # Build Config for travel/drawing
     cfg = Config(
         steps_per_mm=args.steps_per_mm,
         invert_y=bool(args.invert_y),
@@ -475,6 +634,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         offset_y_mm=args.offset_y_mm,
         scale_x=args.scale_x,
         scale_y=args.scale_y,
+        reorder=not args.no_reorder,
     )
 
 

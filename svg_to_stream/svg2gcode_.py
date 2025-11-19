@@ -3,19 +3,16 @@
 """
 omnirevolve_svg_to_gcode.py — SVG → G-code converter for pen plotter / laser.
 
-Robust pipeline:
-
-  1) Fix SVG root if it has no width/height (some files break svg-to-gcode).
-  2) Use svg-to-gcode to convert SVG into *raw* G-code in its own coordinate
-     system (whatever units svg-to-gcode decides to use).
-  3) Parse this raw G-code, compute a bounding box for all X/Y coordinates.
-  4) Compute a scale + offset so that the drawing fits into the given page
-     (A4 by default) with margins, preserving aspect ratio.
-  5) Re-write G-code with scaled and shifted X/Y coordinates.
-
-This way we do NOT rely on SVG viewBox / width / height semantics and do not
-fight with svg-to-gcode internals. Geometry is preserved exactly as produced
-by svg-to-gcode; we only apply a single global linear transform.
+Pipeline:
+- Read SVG, inspect its viewBox / width / height.
+- Compute a default scale so that the SVG fits into an A4 page (210×297 mm)
+  with a configurable margin, keeping aspect ratio.
+- Optionally override that scale via --scale / --scale-x / --scale-y.
+- Ensure the <svg> root element has width/height attributes so that
+  svg-to-gcode does not crash on "None.isnumeric()".
+- Use svg-to-gcode to generate "raw" G-code (in SVG units).
+- Post-process the G-code: scale and offset all X/Y coordinates according
+  to the chosen scale and margin.
 
 Dependencies:
     pip install svg-to-gcode
@@ -38,8 +35,8 @@ from svg_to_gcode.compiler import Compiler, interfaces
 # ---------------- SVG helpers ----------------
 
 
-def _parse_float(s: str | None) -> Optional[float]:
-    """Parse a float from '123', '123px', '210mm', etc. Units are ignored."""
+def _parse_float(s: str) -> Optional[float]:
+    """Parse a float from a CSS length like '123', '123px', '210mm'. Unit is ignored."""
     if s is None:
         return None
     s = s.strip()
@@ -54,15 +51,66 @@ def _parse_float(s: str | None) -> Optional[float]:
         return None
 
 
-def ensure_svg_has_size(svg_path: Path) -> Path:
+def read_svg_geometry(svg_path: Path) -> Tuple[float, float, float, float]:
+    """
+    Read svg width/height and viewBox.
+
+    Returns:
+        (min_x, min_y, width_units, height_units)
+    where all values are in "SVG units". Units are *not* converted to mm;
+    we only care about relative scaling.
+    """
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+
+    # SVG namespace handling (strip it if present)
+    tag = root.tag
+    if "}" in tag:
+        _, bare = tag.split("}", 1)
+    else:
+        bare = tag
+    if bare.lower() != "svg":
+        raise ValueError(f"Root element is not <svg>: {tag}")
+
+    view_box_raw = root.get("viewBox") or root.get("viewbox")
+    if view_box_raw:
+        parts = view_box_raw.replace(",", " ").split()
+        if len(parts) == 4:
+            min_x = float(parts[0])
+            min_y = float(parts[1])
+            width_units = float(parts[2])
+            height_units = float(parts[3])
+        else:
+            # Fallback to width/height
+            min_x = 0.0
+            min_y = 0.0
+            width_units = _parse_float(root.get("width") or "100") or 100.0
+            height_units = _parse_float(root.get("height") or "100") or 100.0
+    else:
+        min_x = 0.0
+        min_y = 0.0
+        width_units = _parse_float(root.get("width") or "100") or 100.0
+        height_units = _parse_float(root.get("height") or "100") or 100.0
+
+    if width_units <= 0 or height_units <= 0:
+        raise ValueError("Bad SVG dimensions: width/height must be > 0")
+
+    return min_x, min_y, width_units, height_units
+
+
+def ensure_svg_has_size(
+    svg_path: Path,
+    width_units: float,
+    height_units: float,
+) -> Path:
     """
     Make sure the <svg> root element has width/height attributes,
-    because svg-to-gcode's parse_file() expects them and may crash
+    because svg-to-gcode's parse_file() expects them and crashes
     if height is missing.
 
     If width/height are present, return the original svg_path.
     Otherwise, create a temporary SVG file with integer width/height
-    (based on viewBox or fallback) and return its path.
+    and return its path.
     """
     tree = ET.parse(svg_path)
     root = tree.getroot()
@@ -73,26 +121,10 @@ def ensure_svg_has_size(svg_path: Path) -> Path:
     if has_width and has_height:
         return svg_path  # nothing to fix
 
-    # Try to use viewBox dimensions if available
-    view_box_raw = root.get("viewBox") or root.get("viewbox")
-    if view_box_raw:
-        parts = view_box_raw.replace(",", " ").split()
-        if len(parts) == 4:
-            try:
-                vb_w = float(parts[2])
-                vb_h = float(parts[3])
-            except ValueError:
-                vb_w = vb_h = 100.0
-        else:
-            vb_w = vb_h = 100.0
-    else:
-        vb_w = _parse_float(root.get("width")) or 100.0
-        vb_h = _parse_float(root.get("height")) or 100.0
-
     if not has_width:
-        root.set("width", str(int(round(vb_w))))
+        root.set("width", str(int(round(width_units))))
     if not has_height:
-        root.set("height", str(int(round(vb_h))))
+        root.set("height", str(int(round(height_units))))
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".svg")
     tmp_path = Path(tmp.name)
@@ -104,41 +136,7 @@ def ensure_svg_has_size(svg_path: Path) -> Path:
 
 # ---------------- G-code helpers ----------------
 
-# Matches X<number> or Y<number>, e.g. "X12.345", "Y-0.5"
 _COORD_RE = re.compile(r"([XY])([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)")
-
-
-def compute_gcode_bbox(text: str) -> Optional[Tuple[float, float, float, float]]:
-    """
-    Compute bounding box of all X/Y coordinates in a G-code text.
-
-    Returns:
-        (min_x, min_y, max_x, max_y)  in G-code units
-    or None if there are no X/Y coordinates at all.
-    """
-    min_x = float("inf")
-    min_y = float("inf")
-    max_x = float("-inf")
-    max_y = float("-inf")
-
-    for line in text.splitlines():
-        for m in _COORD_RE.finditer(line):
-            axis = m.group(1)
-            val = float(m.group(2))
-            if axis == "X":
-                if val < min_x:
-                    min_x = val
-                if val > max_x:
-                    max_x = val
-            else:  # 'Y'
-                if val < min_y:
-                    min_y = val
-                if val > max_y:
-                    max_y = val
-
-    if min_x == float("inf") or min_y == float("inf"):
-        return None
-    return min_x, min_y, max_x, max_y
 
 
 def scale_and_offset_gcode(
@@ -160,10 +158,12 @@ def scale_and_offset_gcode(
             new_val = val * sx + offset_x
         else:
             new_val = val * sy + offset_y
+        # 4 decimal places is usually enough for plotters/lasers
         return f"{axis}{new_val:.4f}"
 
     out_lines = []
     for line in text.splitlines():
+        # Fast path: only touch lines that mention X or Y
         if "X" in line or "Y" in line:
             new_line = _COORD_RE.sub(repl, line)
             out_lines.append(new_line)
@@ -177,7 +177,7 @@ def scale_and_offset_gcode(
 
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="Convert SVG to G-code (via svg-to-gcode) and fit it onto a page."
+        description="Convert SVG to G-code with automatic A4 scaling (via svg-to-gcode)."
     )
     ap.add_argument("input", help="Input SVG file")
     ap.add_argument(
@@ -213,24 +213,25 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Depth per pass along Z (mm). For a pen plotter this is usually 0.0.",
     )
 
-    # Page geometry (defaults: A4 portrait with margin)
+    # Page geometry (defaults: A4 portrait with small margin)
     ap.add_argument(
         "--page-width-mm",
         type=float,
         default=210.0,
-        help="Target page width in mm (default: 210, A4 width).",
+        help="Target page width in mm (default: 210, i.e. A4 width).",
     )
     ap.add_argument(
         "--page-height-mm",
         type=float,
         default=297.0,
-        help="Target page height in mm (default: 297, A4 height).",
+        help="Target page height in mm (default: 297, i.e. A4 height).",
     )
     ap.add_argument(
         "--margin-mm",
         type=float,
         default=10.0,
-        help="Margin from page border in mm (default: 10).",
+        help="Margin from page border in mm (default: 10). "
+             "SVG content is placed inside [margin, page - margin].",
     )
 
     # Scaling overrides
@@ -238,22 +239,20 @@ def build_argparser() -> argparse.ArgumentParser:
         "--scale",
         type=float,
         default=None,
-        help="Uniform scale factor (G-code units → mm). "
-             "If set, overrides automatic fit. "
-             "If not set, scale is chosen automatically so that the drawing "
-             "fits into the page (with margins), keeping aspect ratio.",
+        help="Uniform scale factor (overrides automatic A4 fit). "
+             "If set, --scale-x/--scale-y are ignored unless specified explicitly.",
     )
     ap.add_argument(
         "--scale-x",
         type=float,
         default=None,
-        help="Explicit X scale factor. Overrides --scale for X.",
+        help="Explicit X scale factor (SVG units → mm). Overrides --scale for X.",
     )
     ap.add_argument(
         "--scale-y",
         type=float,
         default=None,
-        help="Explicit Y scale factor. Overrides --scale for Y.",
+        help="Explicit Y scale factor (SVG units → mm). Overrides --scale for Y.",
     )
 
     return ap
@@ -272,13 +271,43 @@ def main(argv: list[str] | None = None) -> None:
     if not svg_path.is_file():
         raise SystemExit(f"Input SVG not found: {svg_path}")
 
-    # 1) Ensure SVG has width/height so svg-to-gcode does not crash
-    fixed_svg_path = ensure_svg_has_size(svg_path)
+    # 1) Read SVG geometry (in SVG units)
+    min_x, min_y, svg_w_units, svg_h_units = read_svg_geometry(svg_path)
 
-    # 2) Use svg-to-gcode to compile raw G-code (in whatever units)
+    # 1a) Ensure svg-to-gcode sees width/height in the root element
+    fixed_svg_path = ensure_svg_has_size(svg_path, svg_w_units, svg_h_units)
+
+    # 2) Compute automatic scale to fit page (A4 by default)
+    avail_w_mm = max(1e-6, args.page_width_mm - 2.0 * args.margin_mm)
+    avail_h_mm = max(1e-6, args.page_height_mm - 2.0 * args.margin_mm)
+
+    auto_scale_x = avail_w_mm / svg_w_units
+    auto_scale_y = avail_h_mm / svg_h_units
+    auto_uniform = min(auto_scale_x, auto_scale_y)
+
+    # Start from automatic uniform scale
+    sx = auto_uniform
+    sy = auto_uniform
+
+    # Apply user overrides
+    if args.scale is not None:
+        sx = sy = args.scale
+    if args.scale_x is not None:
+        sx = args.scale_x
+    if args.scale_y is not None:
+        sy = args.scale_y
+
+    # Offsets: map SVG (min_x, min_y) → (margin, margin)
+    # new_x = (x * sx) + offset_x; we want x = min_x → margin
+    # so offset_x = margin - min_x * sx
+    offset_x = args.margin_mm - min_x * sx
+    offset_y = args.margin_mm - min_y * sy
+
+    # 3) Use svg-to-gcode to compile raw (unscaled) G-code into a temp file
+    #    Note: svg-to-gcode interprets coordinates in SVG units; we rescale later.
     curves = parse_file(str(fixed_svg_path))
 
-    # If we created a temporary fixed SVG, we can remove it later
+    # If we created a temporary fixed SVG, we can safely remove it now
     if fixed_svg_path != svg_path:
         try:
             fixed_svg_path.unlink(missing_ok=True)
@@ -295,62 +324,17 @@ def main(argv: list[str] | None = None) -> None:
     with tempfile.NamedTemporaryFile(mode="w+", suffix=".gcode", delete=False) as tmp:
         tmp_path = Path(tmp.name)
 
+    # Compile SVG → raw G-code (SVG units)
     gcode_compiler.append_curves(curves)
     gcode_compiler.compile_to_file(str(tmp_path), passes=args.passes)
 
     raw_text = tmp_path.read_text(encoding="utf-8")
-
-    raw_out = out_path.with_suffix(".raw_gcode")
-    raw_out.write_text(raw_text, encoding="utf-8")
-    print(f"  Raw svg-to-gcode output saved as: {raw_out}")
-
     try:
         tmp_path.unlink(missing_ok=True)
     except Exception:
         pass
 
-    # 3) Compute bounding box in G-code units
-    bbox = compute_gcode_bbox(raw_text)
-    if bbox is None:
-        # No X/Y coordinates at all — nothing to scale
-        out_path.write_text(raw_text, encoding="utf-8")
-        print(f"✓ G-code saved (no XY found) to {out_path}")
-        return
-
-    min_x_raw, min_y_raw, max_x_raw, max_y_raw = bbox
-    width_raw = max_x_raw - min_x_raw
-    height_raw = max_y_raw - min_y_raw
-
-    if width_raw <= 0 or height_raw <= 0:
-        # Degenerate; just copy
-        out_path.write_text(raw_text, encoding="utf-8")
-        print(f"✓ G-code saved (degenerate bbox) to {out_path}")
-        return
-
-    # 4) Compute scale factors
-    avail_w_mm = max(1e-6, args.page_width_mm - 2.0 * args.margin_mm)
-    avail_h_mm = max(1e-6, args.page_height_mm - 2.0 * args.margin_mm)
-
-    auto_scale_x = avail_w_mm / width_raw
-    auto_scale_y = avail_h_mm / height_raw
-    auto_uniform = min(auto_scale_x, auto_scale_y)
-
-    sx = auto_uniform
-    sy = auto_uniform
-
-    # User overrides
-    if args.scale is not None:
-        sx = sy = args.scale
-    if args.scale_x is not None:
-        sx = args.scale_x
-    if args.scale_y is not None:
-        sy = args.scale_y
-
-    # 5) Offsets: map raw bbox (min_x_raw, min_y_raw) → (margin, margin)
-    offset_x = args.margin_mm - min_x_raw * sx
-    offset_y = args.margin_mm - min_y_raw * sy
-
-    # 6) Apply transform and write final G-code
+    # 4) Post-process G-code: scale and offset X/Y
     scaled_text = scale_and_offset_gcode(
         raw_text,
         sx=sx,
@@ -361,16 +345,14 @@ def main(argv: list[str] | None = None) -> None:
 
     out_path.write_text(scaled_text, encoding="utf-8")
 
-    # 7) Report
+    # 5) Report
     print(f"✓ G-code saved to {out_path}")
     print(f"  Source SVG: {svg_path}")
-    print(f"  Raw bbox (G-code units): "
-          f"x=[{min_x_raw:.3f}, {max_x_raw:.3f}], "
-          f"y=[{min_y_raw:.3f}, {max_y_raw:.3f}] "
-          f"→ size=({width_raw:.3f} × {height_raw:.3f})")
+    print(f"  SVG units: width={svg_w_units:.3f}, height={svg_h_units:.3f}, "
+          f"min_x={min_x:.3f}, min_y={min_y:.3f}")
     print(f"  Page: {args.page_width_mm} × {args.page_height_mm} mm, "
           f"margin={args.margin_mm} mm")
-    print(f"  Auto scale: sx={auto_scale_x:.5f}, sy={auto_scale_y:.5f}, "
+    print(f"  Auto scale (fit): sx={auto_scale_x:.5f}, sy={auto_scale_y:.5f}, "
           f"uniform={auto_uniform:.5f}")
     print(f"  Final scale: sx={sx:.5f}, sy={sy:.5f}")
     print(f"  Offsets: offset_x={offset_x:.3f} mm, offset_y={offset_y:.3f} mm")
